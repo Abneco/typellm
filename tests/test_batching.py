@@ -107,6 +107,62 @@ class PrefixWarmupTests(unittest.TestCase):
         self.assertEqual(client.sglang.requests("count"), [])
 
 
+class PerFieldThinkingTests(unittest.TestCase):
+    def thinking_prompts(self, server):
+        return [t for p in server.requests("think")
+                for t in ([p["text"]] if isinstance(p["text"], str) else p["text"])]
+
+    def test_only_fields_that_ask_for_it_think(self):
+        client = TypeLLMClient(model="fake")  # thinking off for the client
+        client.sglang = FakeServer()
+        result = client.generate(context="Receipt", questions={
+            "hard": {"type": "boolean", "instructions": "Hard?", "thinking": True},
+            "easy": {"type": "boolean", "instructions": "Easy?"},
+            "count": {"type": "integer"},
+        })
+        self.assertEqual(result, {"hard": True, "easy": True, "count": 7})
+        [prompt] = self.thinking_prompts(client.sglang)  # one batch, one prompt
+        self.assertIn("Hard?", prompt)
+        self.assertTrue(prompt.endswith("<think>\n"))
+        answers = [t for p in client.sglang.payloads if p not in client.sglang.requests("think")
+                   for t in ([p["text"]] if isinstance(p["text"], str) else p["text"])]
+        self.assertTrue(any("Easy?" in t and "<think>" not in t for t in answers))
+
+    def test_a_field_can_opt_out_of_the_clients_thinking(self):
+        client = TypeLLMClient(model="fake", thinking=True)
+        client.sglang = FakeServer(thinking=True)
+        client.generate(context="Receipt", questions={
+            "a": {"type": "boolean", "instructions": "A?"},
+            "b": {"type": "boolean", "instructions": "B?"},
+            "skip": {"type": "boolean", "instructions": "Skip?", "thinking": False},
+        })
+        prompts = self.thinking_prompts(client.sglang)
+        self.assertEqual(len(client.sglang.requests("think")), 1)
+        self.assertEqual(len(prompts), 2)
+        self.assertFalse(any("Skip?" in t for t in prompts))
+
+    def test_each_field_gets_its_own_budget(self):
+        client = TypeLLMClient(model="fake")
+        client.sglang = FakeServer()
+        client.sglang.thinking_budget = 500  # the client's budget, for fields without their own
+        client.generate(context="Receipt", questions={
+            "short": {"type": "boolean", "instructions": "Short?", "thinking": True, "thinking_budget": 100},
+            "long": {"type": "boolean", "instructions": "Long?", "thinking": True, "thinking_budget": 300},
+            "default": {"type": "boolean", "instructions": "Default?", "thinking": True},
+        })
+        [request] = client.sglang.requests("think")
+        budgets = {next(q for q in ("Short?", "Long?", "Default?") if q in t): params["max_new_tokens"]
+                   for t, params in zip(request["text"], request["sampling_params"])}
+        self.assertEqual(budgets, {"Short?": 100, "Long?": 300, "Default?": 500})
+
+    def test_invalid_settings_are_schema_errors(self):
+        from typellm import SchemaError
+        for field in ({"type": "boolean", "thinking": "yes"}, {"type": "boolean", "thinking_budget": 0},
+                      {"type": "boolean", "thinking_budget": 2.5}):
+            with self.subTest(field=field), self.assertRaises(SchemaError):
+                TypeLLMClient(model="fake").compile_schema({"type": "object", "properties": {"x": field}})
+
+
 class BatchedThinkingTests(unittest.TestCase):
     QUESTIONS = {
         "flag": {"type": "boolean"},

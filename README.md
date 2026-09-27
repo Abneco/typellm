@@ -229,6 +229,21 @@ Set `thinking_budget=2048` to cap reasoning per field; there is no budget by
 default. When reasoning reaches the budget, TypeLLM closes it and moves on to
 the typed answer.
 
+Turn thinking on for only the fields that need it; the others answer at once,
+and the fields that think reason side by side:
+
+```python
+result = client.generate(context=context, questions={
+    "total": {"type": "number"},
+    "category": {"type": "string", "enum": ["meal", "travel", "equipment"]},
+    "policy_ok": {"type": "boolean", "instructions": "Does it meet the travel policy?",
+                  "thinking": True, "thinking_budget": 1024},
+})
+```
+
+A field's `thinking` and `thinking_budget` override the client's; `"thinking":
+False` keeps one field out of a thinking client.
+
 Models with always-on thinking still reason with `thinking=False`;
 `thinking_budget` applies to them too. See [Supported models](#supported-models).
 

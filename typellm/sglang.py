@@ -16,6 +16,11 @@ import httpx
 from .protocol import detect_protocol
 
 
+def _overrides(thinking: bool | None, budget: int | None) -> tuple:
+    """A prompt's own thinking settings as extra arguments; none when it has none."""
+    return () if thinking is None and budget is None else (thinking, budget)
+
+
 class SGLangError(RuntimeError):
     def __init__(self, message: str = "", *, status: int | None = None) -> None:
         super().__init__(message)
@@ -421,8 +426,14 @@ class SGLangClient:
         *,
         add_generation_prompt: bool,
         finish_thinking: bool = True,
+        thinking: bool | None = None,
+        thinking_budget: int | None = None,
     ) -> str:
-        """Render history; optionally finish thinking before constrained decoding."""
+        """Render history; optionally finish thinking before constrained decoding.
+
+        thinking and thinking_budget override the client's for this prompt.
+        """
+        think = self.thinking if thinking is None else thinking
         tokenizer = self._get_chat_tokenizer()
         if not getattr(tokenizer, "chat_template", None):
             raise SGLangError("The served tokenizer does not define a chat template")
@@ -435,7 +446,7 @@ class SGLangClient:
                 list(messages),
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
-                enable_thinking=self.thinking and add_generation_prompt,
+                enable_thinking=think and add_generation_prompt,
             )
         except Exception as exc:
             raise SGLangError(
@@ -450,16 +461,19 @@ class SGLangClient:
         if bos and rendered.startswith(bos) and tokenizer.encode("x")[0] == tokenizer.bos_token_id:
             rendered = rendered[len(bos):]
         if add_generation_prompt and finish_thinking:
-            return self._prepare_answer_prefix(rendered)
+            return self._prepare_answer_prefix(rendered, *_overrides(thinking, thinking_budget))
         return rendered
 
-    def _prepare_answer_prefix(self, prefix: str) -> str:
+    def _prepare_answer_prefix(self, prefix: str, thinking: bool | None = None,
+                               budget: int | None = None) -> str:
         protocol = detect_protocol(self._get_chat_tokenizer())
-        if self.thinking or protocol.has_open_thinking(prefix):
-            return self._finish_thinking(prefix)
+        # A template that always opens thinking reasons whatever the setting.
+        if (self.thinking if thinking is None else thinking) or protocol.has_open_thinking(prefix):
+            return self._finish_thinking(prefix, *(() if budget is None else (budget,)))
         return prefix
 
-    def _continuation_parts(self, question: str | None = None) -> tuple[str, str]:
+    def _continuation_parts(self, question: str | None = None,
+                            thinking: bool | None = None) -> tuple[str, str]:
         # Derive turn delimiters from the actual tokenizer, never hardcode a
         # model's chat tokens. The marker is confined to this local template probe.
         marker = "TYPELLM_ASSISTANT_BOUNDARY_8b46c9"
@@ -474,6 +488,7 @@ class SGLangClient:
         extended = self.render_chat(
             messages + [{"role": "user", "content": question}],
             add_generation_prompt=True, finish_thinking=False,
+            **({} if thinking is None else {"thinking": thinking}),
         )
         if extended.count(marker) != 1:
             raise SGLangError("Chat template cannot preserve assistant content for KV continuation")
@@ -486,20 +501,37 @@ class SGLangClient:
         closing, _ = self._continuation_parts()
         return prompt + answer + closing
 
-    def extend_chat_prefix(self, prefix: str, question: str, *, finish_thinking: bool = True) -> str:
-        _, suffix = self._continuation_parts(question)
+    def extend_chat_prefix(self, prefix: str, question: str, *, finish_thinking: bool = True,
+                           thinking: bool | None = None, thinking_budget: int | None = None) -> str:
+        _, suffix = self._continuation_parts(question, thinking)
         prompt = prefix + suffix
-        return self._prepare_answer_prefix(prompt) if finish_thinking else prompt
+        return (self._prepare_answer_prefix(prompt, *_overrides(thinking, thinking_budget))
+                if finish_thinking else prompt)
 
-    def prepare_answer_prefixes(self, prefixes: Sequence[str]) -> list[str]:
-        """Finish thinking for many generation prompts in one batched request."""
+    def prepare_answer_prefixes(
+        self,
+        prefixes: Sequence[str],
+        thinking: Sequence[bool | None] | None = None,
+        budgets: Sequence[int | None] | None = None,
+    ) -> list[str]:
+        """Finish thinking for many generation prompts in one batched request.
+
+        thinking and budgets give each prompt's own settings (None: the client's);
+        only the prompts that think join the batch.
+        """
         protocol = detect_protocol(self._get_chat_tokenizer())
-        pending = [i for i, p in enumerate(prefixes) if self.thinking or protocol.has_open_thinking(p)]
+        wants = [self.thinking if t is None else t for t in (thinking or [None] * len(prefixes))]
+        budgets = list(budgets or [None] * len(prefixes))
+        pending = [i for i, p in enumerate(prefixes) if wants[i] or protocol.has_open_thinking(p)]
         finished = list(prefixes)
+        # Budgets go only to prompts that have their own, as before for the rest.
+        own = [budgets[i] for i in pending]
         if len(pending) == 1:
-            finished[pending[0]] = self._finish_thinking(prefixes[pending[0]])
+            finished[pending[0]] = self._finish_thinking(prefixes[pending[0]], *([] if own[0] is None else own))
         elif pending:
-            for i, value in zip(pending, self._finish_thinking_batch([prefixes[i] for i in pending])):
+            done = self._finish_thinking_batch([prefixes[i] for i in pending],
+                                               *(() if all(b is None for b in own) else (own,)))
+            for i, value in zip(pending, done):
                 finished[i] = value
         return finished
 
@@ -527,12 +559,14 @@ class SGLangClient:
             self._context_length_cache = min(limits)
         return self._context_length_cache
 
-    def _finish_thinking(self, prefix: str) -> str:
-        params, image_tokens = self._thinking_params(prefix)
+    def _finish_thinking(self, prefix: str, budget: int | None = None) -> str:
+        params, image_tokens = self._thinking_params(prefix, budget=budget)
         response = self._generate({"text": prefix, "sampling_params": params})
         return self._complete_thinking(prefix, response, image_tokens)
 
-    def _finish_thinking_batch(self, prefixes: Sequence[str]) -> list[str]:
+    def _finish_thinking_batch(self, prefixes: Sequence[str],
+                               budgets: Sequence[int | None] | None = None) -> list[str]:
+        budgets = list(budgets or [None] * len(prefixes))
         served: list[int | None] = [None] * len(prefixes)
         if self._active_images.get():
             response = self._generate({
@@ -543,7 +577,8 @@ class SGLangClient:
                 raise SGLangError("Unexpected prompt-count batch response shape")
             served = [item.get("meta_info", {}).get("prompt_tokens") if isinstance(item, Mapping) else None
                       for item in response]
-        planned = [self._thinking_params(prefix, count) for prefix, count in zip(prefixes, served)]
+        planned = [self._thinking_params(prefix, count, budget)
+                   for prefix, count, budget in zip(prefixes, served, budgets)]
         response = self._generate({
             "text": list(prefixes),
             "sampling_params": [params for params, _ in planned],
@@ -553,7 +588,8 @@ class SGLangClient:
         return [self._complete_thinking(prefix, item, image_tokens)
                 for prefix, item, (_, image_tokens) in zip(prefixes, response, planned)]
 
-    def _thinking_params(self, prefix: str, served_tokens: int | None = None) -> tuple[dict[str, Any], int]:
+    def _thinking_params(self, prefix: str, served_tokens: int | None = None,
+                         budget: int | None = None) -> tuple[dict[str, Any], int]:
         """Return sampling params for one thinking request and its image-token count."""
         tokenizer = self._get_chat_tokenizer()
         protocol = detect_protocol(tokenizer)
@@ -579,7 +615,8 @@ class SGLangClient:
         available = self._context_length() - prefix_tokens - self.answer_reserve_tokens - closing_tokens - 16
         if available <= 0:
             raise SGLangError("Input leaves no room for thinking and the final constrained answer")
-        limit = available if self.thinking_budget is None else min(available, self.thinking_budget)
+        budget = self.thinking_budget if budget is None else budget
+        limit = available if budget is None else min(available, budget)
         return {
             "max_new_tokens": limit,
             "temperature": 0.6, "top_p": 0.95, "top_k": 20,

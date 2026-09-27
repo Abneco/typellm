@@ -32,6 +32,9 @@ class Decision:
     return_probabilities: bool = False
     depends_on: tuple[str, ...] | None = None
     nullable: bool = False
+    # None follows the client's thinking and thinking_budget.
+    thinking: bool | None = None
+    thinking_budget: int | None = None
 
 
 def _has_duplicates(values: Sequence[Any]) -> bool:
@@ -231,7 +234,13 @@ def compile_json_schema(schema: Mapping[str, Any]) -> list[Decision]:
             if len(set(dependencies)) != len(dependencies):
                 raise SchemaError(f"depends_on for {decision.name!r} contains duplicates")
             dependencies = tuple(dependencies)
-        compiled.append(replace(decision, depends_on=dependencies))
+        thinking = field.get("thinking")
+        if thinking is not None and type(thinking) is not bool:
+            raise SchemaError(f"thinking for {decision.name!r} must be a boolean")
+        budget = field.get("thinking_budget")
+        if budget is not None and (type(budget) is not int or budget <= 0):
+            raise SchemaError(f"thinking_budget for {decision.name!r} must be a positive integer")
+        compiled.append(replace(decision, depends_on=dependencies, thinking=thinking, thinking_budget=budget))
     dependency_layers(compiled)
     return compiled
 

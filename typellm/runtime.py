@@ -63,6 +63,8 @@ class Choice:
     return_probabilities: bool = False
     depends_on: tuple[str, ...] | None = None
     nullable: bool = False
+    thinking: bool | None = None
+    thinking_budget: int | None = None
 
     def __post_init__(self) -> None:
         if not self.choices and self.numeric_type is None and not self.text_type:
@@ -256,6 +258,8 @@ class TypeLLMClient:
                     return_probabilities=item.return_probabilities,
                     depends_on=item.depends_on,
                     nullable=item.nullable,
+                    thinking=item.thinking,
+                    thinking_budget=item.thinking_budget,
                 )
                 for item in decisions
             ]
@@ -694,14 +698,24 @@ def _execute_batch_decisions(
     defer = callable(getattr(client, "prepare_answer_prefixes", None))
     raw_prompts: list[str] = []
 
-    def generation_prompt(parent, content, messages):
+    raw_thinking: list[bool | None] = []
+    raw_budgets: list[int | None] = []
+
+    def generation_prompt(parent, content, messages, decision):
+        # A field's own thinking settings are passed only when it has them, so
+        # clients without per-prompt thinking keep working.
+        own = {key: value for key, value in (("thinking", decision.thinking),
+                                             ("thinking_budget", decision.thinking_budget))
+               if value is not None}
         if parent is not None:
-            prompt = (client.extend_chat_prefix(parent, content, finish_thinking=False)
-                      if defer else client.extend_chat_prefix(parent, content))
+            prompt = (client.extend_chat_prefix(parent, content, finish_thinking=False, **own)
+                      if defer else client.extend_chat_prefix(parent, content, **own))
         else:
-            prompt = (client.render_chat(messages, add_generation_prompt=True, finish_thinking=False)
-                      if defer else client.render_chat(messages, add_generation_prompt=True))
+            prompt = (client.render_chat(messages, add_generation_prompt=True, finish_thinking=False, **own)
+                      if defer else client.render_chat(messages, add_generation_prompt=True, **own))
         raw_prompts.append(prompt)
+        raw_thinking.append(decision.thinking)
+        raw_budgets.append(decision.thinking_budget)
         return len(raw_prompts) - 1
 
     decision_slots = {}
@@ -712,7 +726,7 @@ def _execute_batch_decisions(
             {"role": "user", "content": question_content(decision)}
         ]
         parent = (parent_prefixes or {}).get(decision.name)
-        decision_slots[index] = generation_prompt(parent, question_content(decision), messages)
+        decision_slots[index] = generation_prompt(parent, question_content(decision), messages, decision)
         if decision.text_type:
             text_pending.append((index, decision, messages))
             continue
@@ -734,7 +748,7 @@ def _execute_batch_decisions(
             scoring_slots.append(
                 decision_slots[index] if variant.choices == decision.choices else
                 generation_prompt(parent, variant_content,
-                                  shared_messages + [{"role": "user", "content": variant_content}]))
+                                  shared_messages + [{"role": "user", "content": variant_content}], variant))
             scoring_ids.append(ids)
             scoring_prefills.append(decision.label_prefill)
         finite_indexes.append(index)
@@ -753,7 +767,10 @@ def _execute_batch_decisions(
         cache_meta = client.cache_prefix(shared_prefix)
         LOG.info("batch_shared_prefix_cached_tokens=%s", cache_meta.get("cached_tokens"))
 
-    ready = client.prepare_answer_prefixes(raw_prompts) if defer else raw_prompts
+    per_field = any(t is not None for t in raw_thinking) or any(b is not None for b in raw_budgets)
+    ready = (client.prepare_answer_prefixes(raw_prompts, **({"thinking": raw_thinking, "budgets": raw_budgets}
+                                                           if per_field else {}))
+             if defer else raw_prompts)
     prompts = [ready[decision_slots[index]] for index in finite_indexes]
     scoring_prompts = [ready[slot] + prefill for slot, prefill in zip(scoring_slots, scoring_prefills)]
     # Open fields continue from {"name": ; history gets the closed object.
