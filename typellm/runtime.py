@@ -156,9 +156,8 @@ class TypeLLMClient:
         label_pool: Sequence[str] | None = None,
         numeric_max_digits: int = 32,
         tokenizer: str | None = None,
-        thinking: bool = False,
         thinking_budget: int | None = None,
-        text_max_tokens: int = 512,
+        text_max_tokens: int = 128,
     ) -> None:
         _validate_decoding(mode, temperature)
         if type(numeric_max_digits) is not int or numeric_max_digits <= 0:
@@ -168,7 +167,6 @@ class TypeLLMClient:
             model,
             timeout,
             tokenizer=tokenizer,
-            thinking=thinking,
             thinking_budget=thinking_budget,
             text_max_tokens=text_max_tokens,
             answer_reserve_tokens=numeric_max_digits + 3,
@@ -930,9 +928,8 @@ def run_schema(
     seed: int | None = None,
     numeric_max_digits: int = 32,
     tokenizer: str | None = None,
-    thinking: bool = False,
     thinking_budget: int | None = None,
-    text_max_tokens: int = 512,
+    text_max_tokens: int = 128,
     print_final_prompt: bool = False,
 ) -> dict[str, Any]:
     client = TypeLLMClient(
@@ -943,7 +940,6 @@ def run_schema(
         seed=seed,
         numeric_max_digits=numeric_max_digits,
         tokenizer=tokenizer,
-        thinking=thinking,
         thinking_budget=thinking_budget,
         text_max_tokens=text_max_tokens,
     )

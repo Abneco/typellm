@@ -46,8 +46,9 @@ def main():
         ('independent', {k: v for k, v in QUESTIONS.items() if k != 'check'}),
         ('with depends_on', QUESTIONS),
     ]:
-        client = TypeLLMClient(args.url, model=args.model, thinking=args.thinking)
-        values = client.generate(context='Read the attached receipt.', images=[image], questions=questions)
+        client = TypeLLMClient(args.url, model=args.model)
+        values = client.generate(context='Read the attached receipt.', images=[image],
+                                 questions={k: {**v, 'thinking': args.thinking} for k, v in questions.items()})
         ok = all(values[k] == EXPECTED[k] for k in values)
         passed &= ok
         rows.append({'fields': fields, 'values': values, 'passed': ok})

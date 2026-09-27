@@ -73,7 +73,7 @@ def main():
     def run_one(case, thinking):
         name, context, questions, expected = case
         client = TypeLLMClient(args.url, model=args.model, tokenizer=args.model,
-            thinking=thinking, thinking_budget=args.thinking_budget, text_max_tokens=128,
+            thinking_budget=args.thinking_budget, text_max_tokens=128,
             timeout=180, seed=42)
         client.sglang._chat_tokenizer = tokenizer
         client.sglang._numeric_tokens = numeric
@@ -93,7 +93,7 @@ def main():
         client.sglang._request = record_request
         start = time.monotonic()
         try:
-            result = client.generate(context=context, questions=questions)
+            result = client.generate(context=context, questions={k: {**v, 'thinking': True} for k, v in questions.items()} if thinking else questions)
             values = {k: v['value'] if questions[k].get('return_probabilities') else v for k, v in result.items()}
             row.update(result=result, type_valid=validate(result, questions), correct=values == expected)
         except Exception as exc:

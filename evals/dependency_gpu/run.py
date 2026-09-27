@@ -37,7 +37,7 @@ def cases():
 
 
 def run(args, name, questions, expected, thinking):
-    client = TypeLLMClient(args.url, model=args.model, thinking=thinking,
+    client = TypeLLMClient(args.url, model=args.model,
                            thinking_budget=args.thinking_budget, text_max_tokens=64)
     requests = []
     original = client.sglang._request
@@ -58,7 +58,7 @@ def run(args, name, questions, expected, thinking):
     row = {'case': name, 'thinking': thinking}
     try:
         context = 'Follow the named dependency results carefully.\n' + ('Background: this is a deterministic dependency test.\n' * 100)
-        result = client.generate(context=context, questions=questions)
+        result = client.generate(context=context, questions={k: {**v, 'thinking': True} for k, v in questions.items()} if thinking else questions)
         values = {k: v['value'] if isinstance(v, dict) else v for k, v in result.items()}
         prompts = dict(zip(questions, client.last_prompts))
         tokenizer = client.sglang._get_chat_tokenizer()

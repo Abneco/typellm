@@ -39,8 +39,8 @@ class ProtocolTokenizer(FakeChatTokenizer):
 
 
 class ProtocolTests(unittest.TestCase):
-    def client(self, family, thinking=False, response=None):
-        client = SGLangClient(thinking=thinking, thinking_budget=64)
+    def client(self, family, response=None):
+        client = SGLangClient(thinking_budget=64)
         client._chat_tokenizer = ProtocolTokenizer(family)
         client._context_length_cache = 8192
         end = '</think>'
@@ -59,9 +59,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_gemma_is_rejected_before_inference(self):
         for thinking in (False, True):
-            client = self.client('gemma', thinking)
+            client = self.client('gemma')
             with self.assertRaisesRegex(SGLangError, 'Gemma 4.*not supported'):
-                client.render_chat([], add_generation_prompt=True)
+                client.render_chat([], add_generation_prompt=True, thinking=thinking)
             client._request.assert_not_called()
 
     def test_native_turn_stop_recovers_preserved_and_filtered_terminators(self):
@@ -69,7 +69,7 @@ class ProtocolTests(unittest.TestCase):
             for matched in (ending, token):
                 for suffix in ('', ending + '\n'):
                     with self.subTest(family=family, matched=matched, suffix=suffix):
-                        client = self.client(family, True, {
+                        client = self.client(family, {
                             'text': 'Keep reasoning' + suffix,
                             'meta_info': {'finish_reason': {'type': 'stop', 'matched': matched}},
                         })
@@ -91,15 +91,15 @@ class ProtocolTests(unittest.TestCase):
             ('Partial<|im_end|>', {'type': 'error', 'matched': 3}),
         ]:
             with self.subTest(text=text, finish=finish):
-                client = self.client('minicpm5', True, {'text': text, 'meta_info': {'finish_reason': finish}})
+                client = self.client('minicpm5', {'text': text, 'meta_info': {'finish_reason': finish}})
                 with self.assertRaises(SGLangError):
                     client._finish_thinking('<think>\n')
 
     def test_minicpm5_switch_and_ring_always_thinking(self):
         for family in ('minicpm5', 'ring'):
             for thinking in (False, True):
-                client = self.client(family, thinking)
-                prompt = client.render_chat([], add_generation_prompt=True)
+                client = self.client(family)
+                prompt = client.render_chat([], add_generation_prompt=True, thinking=thinking)
                 expected = thinking or family == 'ring'
                 self.assertEqual(client._request.called, expected)
                 parent = client.complete_chat_prefix(prompt, 'A')
@@ -108,9 +108,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_non_thinking_templates_reject_requested_thinking(self):
         for family in ('ling',):
-            client = self.client(family, True)
+            client = self.client(family)
             with self.assertRaisesRegex(SGLangError, 'may not support thinking'):
-                client.render_chat([], add_generation_prompt=True)
+                client.render_chat([], add_generation_prompt=True, thinking=True)
             client._request.assert_not_called()
 
 

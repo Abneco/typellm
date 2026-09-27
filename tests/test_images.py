@@ -255,7 +255,6 @@ class ImageRequestTests(unittest.TestCase):
 
     def test_thinking_budget_counts_image_tokens_on_the_server(self):
         client = FakeServerClient()
-        client.thinking = True
         client.thinking_budget = None
         client._context_length_cache = 1000
         prefix = VisionTokenizer().apply_chat_template(

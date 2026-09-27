@@ -159,13 +159,10 @@ class SGLangClient:
         timeout: float = 120.0,
         tokenizer: str | None = None,
         *,
-        thinking: bool = False,
         thinking_budget: int | None = None,
-        text_max_tokens: int = 512,
+        text_max_tokens: int = 128,
         answer_reserve_tokens: int = 64,
     ) -> None:
-        if type(thinking) is not bool:
-            raise ValueError("thinking must be a boolean")
         if thinking_budget is not None and (type(thinking_budget) is not int or thinking_budget <= 0):
             raise ValueError("thinking_budget must be a positive integer or None")
         if type(text_max_tokens) is not int or text_max_tokens <= 0:
@@ -175,7 +172,7 @@ class SGLangClient:
         self.answer_reserve_tokens = max(answer_reserve_tokens, text_max_tokens)
         self._context_length_cache: int | None = None
         self.text_max_tokens = text_max_tokens
-        self.thinking = thinking
+        # The budget of fields that think without their own.
         self.thinking_budget = thinking_budget
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -445,9 +442,9 @@ class SGLangClient:
     ) -> str:
         """Render history; optionally finish thinking before constrained decoding.
 
-        thinking and thinking_budget override the client's for this prompt.
+        thinking asks this prompt to reason; thinking_budget overrides the client's.
         """
-        think = self.thinking if thinking is None else thinking
+        think = bool(thinking)
         tokenizer = self._get_chat_tokenizer()
         if not getattr(tokenizer, "chat_template", None):
             raise SGLangError("The served tokenizer does not define a chat template")
@@ -482,7 +479,7 @@ class SGLangClient:
                                budget: int | None = None) -> str:
         protocol = detect_protocol(self._get_chat_tokenizer())
         # A template that always opens thinking reasons whatever the setting.
-        if (self.thinking if thinking is None else thinking) or protocol.has_open_thinking(prefix):
+        if thinking or protocol.has_open_thinking(prefix):
             return self._finish_thinking(prefix, *(() if budget is None else (budget,)))
         return prefix
 
@@ -540,11 +537,11 @@ class SGLangClient:
     ) -> list[str]:
         """Finish thinking for many generation prompts in one batched request.
 
-        thinking and budgets give each prompt's own settings (None: the client's);
-        only the prompts that think join the batch.
+        thinking says which prompts reason and budgets their own budgets (None: the
+        client's); only the prompts that think join the batch.
         """
         protocol = detect_protocol(self._get_chat_tokenizer())
-        wants = [self.thinking if t is None else t for t in (thinking or [None] * len(prefixes))]
+        wants = [bool(t) for t in (thinking or [None] * len(prefixes))]
         budgets = list(budgets or [None] * len(prefixes))
         pending = [i for i, p in enumerate(prefixes) if wants[i] or protocol.has_open_thinking(p)]
         finished = list(prefixes)
@@ -621,7 +618,7 @@ class SGLangClient:
         protocol = detect_protocol(tokenizer)
         if not protocol.has_open_thinking(prefix):
             raise SGLangError(
-                f"thinking=True requires a native chat template ending in an open "
+                f"thinking requires a native chat template ending in an open "
                 f"{protocol.thinking_open} block; this template may not support thinking"
             )
         forced_end = protocol.forced_close()

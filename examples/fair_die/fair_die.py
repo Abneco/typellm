@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--output', type=Path, default=Path(__file__).with_name('result.json'))
     args = parser.parse_args()
     client = TypeLLMClient(args.url, model=args.model, tokenizer=args.tokenizer,
-                           seed=42, thinking=False, timeout=300)
+                           seed=42, timeout=300)
     runs = {}
     for budget in (1, 'auto', 8, 'all'):
         start = time.monotonic()

@@ -153,6 +153,9 @@ result = client.generate(
 )
 ```
 
+Free text stops after 128 tokens. Pass `text_max_tokens=` to the client for
+longer answers, or set `maxLength` on a field to cap its characters.
+
 Ask for a numeric answer without enumerating every possible value:
 
 ```python
@@ -214,23 +217,8 @@ result = client.generate(
 
 ## Thinking mode
 
-Thinking is off by default. Enable it when constructing the client:
-
-```python
-client = TypeLLMClient(
-    "http://127.0.0.1:30000",
-    model="Qwen/Qwen3.8-27B",
-    thinking=True,
-)
-result = client.generate(context=context, questions=questions)
-```
-
-Set `thinking_budget=2048` to cap reasoning per field; there is no budget by
-default. When reasoning reaches the budget, TypeLLM closes it and moves on to
-the typed answer.
-
-Turn thinking on for only the fields that need it; the others answer at once,
-and the fields that think reason side by side:
+Thinking is off by default. Turn it on for the fields that need it; the others
+answer at once, and the fields that think reason side by side:
 
 ```python
 result = client.generate(context=context, questions={
@@ -241,13 +229,16 @@ result = client.generate(context=context, questions={
 })
 ```
 
-A field's `thinking` and `thinking_budget` override the client's; `"thinking":
-False` keeps one field out of a thinking client. After a call,
-`client.last_thinking` maps each field that thought to its reasoning, and
-`client.last_usage.thinking_tokens` counts the reasoning tokens.
+`thinking_budget` caps a field's reasoning; there is no budget by default.
+`TypeLLMClient(..., thinking_budget=2048)` sets one for every field that thinks
+without its own. When reasoning reaches the budget, TypeLLM closes it and moves
+on to the typed answer.
 
-Models with always-on thinking still reason with `thinking=False`;
-`thinking_budget` applies to them too. See [Supported models](#supported-models).
+After a call, `client.last_thinking` maps each field that thought to its
+reasoning, and `client.last_usage.thinking_tokens` counts the reasoning tokens.
+
+Models with always-on thinking reason on every field; `thinking_budget` applies
+to them too. See [Supported models](#supported-models).
 
 ## Image input
 

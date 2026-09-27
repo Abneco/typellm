@@ -102,7 +102,7 @@ class DependencyTests(unittest.TestCase):
         self.assertTrue(client.last_prompts[1].startswith(client.last_prompts[0]))
 
     def test_always_thinking_template_continuation_runs_once(self):
-        client = SGLangClient(thinking=False)
+        client = SGLangClient()
 
         class Tokenizer:
             chat_template = 'test'

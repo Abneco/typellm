@@ -52,10 +52,11 @@ def main():
     parser.add_argument('--output', type=Path, default=HERE / 'result.json')
     args = parser.parse_args()
     client = TypeLLMClient(args.url, model=args.model, tokenizer=args.tokenizer,
-                           thinking=args.thinking, timeout=300)
+                           timeout=300)
     start = time.monotonic()
     result = client.generate(context='Read the attached photo of a restaurant receipt.',
-                             images=[HERE / 'receipt.jpg'], questions=QUESTIONS)
+                             images=[HERE / 'receipt.jpg'],
+                             questions={k: {**v, 'thinking': args.thinking} for k, v in QUESTIONS.items()})
     seconds = time.monotonic() - start
     checks = {name: result[name] == value for name, value in EXPECTED.items()}
     print(json.dumps(result, indent=2, ensure_ascii=False))

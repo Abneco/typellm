@@ -95,6 +95,10 @@ IMAGE_Q = {
               "depends_on": ["quantity", "paid"]},
 }
 
+def thinks(questions):
+    return {name: {**field, "thinking": True} for name, field in questions.items()}
+
+
 CASES = [
     ("receipt", {}, dict(context=RECEIPT, questions=RECEIPT_Q)),
     ("nullable", {}, dict(context="Table 7A. Paid by card. No tip was added.", questions=NULLABLE_Q)),
@@ -102,11 +106,11 @@ CASES = [
     ("die", {}, dict(context="A single roll of a fair die.", questions=DIE_Q)),
     ("math", {}, dict(context="Calculate the requested value accurately.", questions=MATH_Q)),
     ("image", {}, dict(context="Read the attached receipt.", images="receipt", questions=IMAGE_Q)),
-    ("receipt+thinking", {"thinking": True, "thinking_budget": 512}, dict(context=RECEIPT, questions=RECEIPT_Q)),
-    ("incident+thinking", {"thinking": True, "thinking_budget": 512},
-     dict(context="The payments service is returning errors after a deployment.", questions=INCIDENT_Q)),
-    ("math+thinking", {"thinking": True, "thinking_budget": 512},
-     dict(context="Calculate the requested value accurately.", questions=MATH_Q)),
+    ("receipt+thinking", {"thinking_budget": 512}, dict(context=RECEIPT, questions=thinks(RECEIPT_Q))),
+    ("incident+thinking", {"thinking_budget": 512},
+     dict(context="The payments service is returning errors after a deployment.", questions=thinks(INCIDENT_Q))),
+    ("math+thinking", {"thinking_budget": 512},
+     dict(context="Calculate the requested value accurately.", questions=thinks(MATH_Q))),
 ]
 
 
@@ -216,8 +220,8 @@ def features():
     out["usage"] = {"first": first, "repeat": vars(shared.last_usage)}
 
     # 4. timeout: an unbounded thinking call stops near its budget, and the server keeps serving.
-    thinker = client(thinking=True)
-    hard = {"proof": {"type": "boolean", "instructions":
+    thinker = client()
+    hard = {"proof": {"type": "boolean", "thinking": True, "instructions":
                       "Think very carefully, checking every case: is 2^89 - 1 prime? Verify with long division."}}
     start = time.perf_counter()
     try:
@@ -235,19 +239,19 @@ def features():
 
     # 5. cancel: a dependent thinking call stops after its in-flight request.
     cancel = threading.Event()
-    budgeted = client(thinking=True, thinking_budget=256)
+    budgeted = client(thinking_budget=256)
     timer = threading.Timer(1.0, cancel.set)
     timer.start()
     start = time.perf_counter()
     try:
         budgeted.generate(context="The payments service is returning errors after a deployment.",
-                          questions=INCIDENT_Q, cancel=cancel)
+                          questions=thinks(INCIDENT_Q), cancel=cancel)
         cancel_error = None
     except Exception as exc:
         cancel_error = type(exc).__name__
     timer.cancel()
     uncancelled = time.perf_counter()
-    budgeted.generate(context="The payments service is returning errors after a deployment.", questions=INCIDENT_Q)
+    budgeted.generate(context="The payments service is returning errors after a deployment.", questions=thinks(INCIDENT_Q))
     out["cancel"] = {"cancel_at": 1.0, "error": cancel_error, "elapsed": uncancelled - start,
                      "requests_before_stop": budgeted.last_usage.requests if cancel_error is None else None,
                      "full_call_elapsed": time.perf_counter() - uncancelled,

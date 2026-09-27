@@ -427,7 +427,7 @@ class ThinkingTests(unittest.TestCase):
         from typellm import run_schema
         self.assertIsNone(SGLangClient().thinking_budget)
         self.assertIsNone(TypeLLMClient().sglang.thinking_budget)
-        client = SGLangClient(thinking=True)
+        client = SGLangClient()
         client._chat_tokenizer = FakeChatTokenizer()
         client._context_length_cache = 8192
         client._request = Mock(return_value={"text": "Done.</think>"})
@@ -443,7 +443,7 @@ class ThinkingTests(unittest.TestCase):
 
     def make_client(self, response=None):
         from unittest.mock import Mock
-        client = SGLangClient(thinking=True, thinking_budget=128)
+        client = SGLangClient(thinking_budget=128)
         client._context_length_cache = 8192
         tokenizer = FakeChatTokenizer()
         tokenizer.apply_chat_template = Mock(return_value="assistant\n<think>\n")
@@ -453,7 +453,7 @@ class ThinkingTests(unittest.TestCase):
 
     def test_thinking_stops_before_constrained_answer(self):
         client = self.make_client()
-        prompt = client.render_chat([], add_generation_prompt=True)
+        prompt = client.render_chat([], add_generation_prompt=True, thinking=True)
         self.assertEqual(prompt, "assistant\n<think>\nWork done. </think>\n\n")
         self.assertNotIn("illegal answer", prompt)
         params = client._request.call_args.args[1]["sampling_params"]
@@ -464,7 +464,7 @@ class ThinkingTests(unittest.TestCase):
 
     def test_length_stop_forces_closure_and_retains_reasoning(self):
         client = self.make_client({"text": "Partial reasoning", "meta_info": {"finish_reason": {"type": "length"}}})
-        prompt = client.render_chat([], add_generation_prompt=True)
+        prompt = client.render_chat([], add_generation_prompt=True, thinking=True)
         self.assertIn("Partial reasoning", prompt)
         self.assertIn("I will now give the final answer.", prompt)
         self.assertTrue(prompt.endswith("</think>\n\n"))
@@ -499,7 +499,7 @@ class ThinkingTests(unittest.TestCase):
         for text in ("Partial", "Partial</think>"):
             client = self.make_client({"text": text, "meta_info": {"finish_reason": {"type": "abort"}}})
             with self.assertRaisesRegex(SGLangError, "aborted"):
-                client.render_chat([], add_generation_prompt=True)
+                client.render_chat([], add_generation_prompt=True, thinking=True)
 
     def test_forced_thinking_keeps_all_final_decoders(self):
         stops = [{"type": "length"}, {"type": "stop", "matched": "<|im_end|>"}]
@@ -528,20 +528,19 @@ class ThinkingTests(unittest.TestCase):
             client = self.make_client()
             client._request.return_value = response
             with self.subTest(response=response), self.assertRaises(SGLangError):
-                client.render_chat([], add_generation_prompt=True)
+                client.render_chat([], add_generation_prompt=True, thinking=True)
 
     def test_unsupported_template_does_not_generate(self):
         from typellm import SGLangError
         client = self.make_client()
         client._chat_tokenizer.apply_chat_template.return_value = "<think></think>"
         with self.assertRaisesRegex(SGLangError, "native chat template"):
-            client.render_chat([], add_generation_prompt=True)
+            client.render_chat([], add_generation_prompt=True, thinking=True)
         client._request.assert_not_called()
 
     def test_always_thinking_template_reasons_even_when_thinking_is_off(self):
         client = self.make_client()
-        client.thinking = False
-        prompt = client.render_chat([], add_generation_prompt=True)
+        prompt = client.render_chat([], add_generation_prompt=True)  # thinking not asked for
         self.assertEqual(prompt, "assistant\n<think>\nWork done. </think>\n\n")
         self.assertFalse(client._chat_tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"])
 
@@ -552,12 +551,11 @@ class ThinkingTests(unittest.TestCase):
         self.assertFalse(client._chat_tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"])
 
     def test_public_configuration_and_validation(self):
-        self.assertFalse(TypeLLMClient().sglang.thinking)
-        client = TypeLLMClient(thinking=True, thinking_budget=256)
-        self.assertTrue(client.sglang.thinking)
+        client = TypeLLMClient(thinking_budget=256)
         self.assertEqual(client.sglang.thinking_budget, 256)
-        for kwargs in [{"thinking": "false"}, {"thinking": 1}, {"thinking_budget": 0},
-                       {"thinking_budget": True}, {"thinking_budget": 1.5}]:
+        with self.assertRaises(TypeError):
+            TypeLLMClient(thinking=True)  # thinking is chosen per field
+        for kwargs in [{"thinking_budget": 0}, {"thinking_budget": True}, {"thinking_budget": 1.5}]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 TypeLLMClient(**kwargs)
 

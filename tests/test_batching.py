@@ -26,8 +26,8 @@ class FakeServer(SGLangClient):
     Numeric fields decode to 7: the server prefers the end token, then "7".
     """
 
-    def __init__(self, thinking=False):
-        super().__init__(model="fake", thinking=thinking)
+    def __init__(self):
+        super().__init__(model="fake")
         self._chat_tokenizer = ThinkingTokenizer()
         self._context_length_cache = 100_000
         self.payloads = []
@@ -83,6 +83,10 @@ def width(payload):
     return 1 if isinstance(payload["text"], str) else len(payload["text"])
 
 
+def thinks(questions):
+    return {name: {**field, "thinking": True} for name, field in questions.items()}
+
+
 class PrefixWarmupTests(unittest.TestCase):
     MIXED = {"a": {"type": "integer"}, "b": {"type": "number"}, "n": {"type": "string"},
              "k": {"type": "string", "enum": ["x", "y"]}}
@@ -91,8 +95,8 @@ class PrefixWarmupTests(unittest.TestCase):
         for thinking in (False, True):
             with self.subTest(thinking=thinking):
                 client = TypeLLMClient(model="fake")
-                client.sglang = FakeServer(thinking=thinking)
-                client.generate(context="Receipt", questions=self.MIXED)
+                client.sglang = FakeServer()
+                client.generate(context="Receipt", questions=thinks(self.MIXED) if thinking else self.MIXED)
                 warm = client.sglang.requests("count")
                 self.assertEqual(len(warm), 1)
                 # First, before the thinking, number, text and scoring batches.
@@ -113,7 +117,7 @@ class PerFieldThinkingTests(unittest.TestCase):
                 for t in ([p["text"]] if isinstance(p["text"], str) else p["text"])]
 
     def test_only_fields_that_ask_for_it_think(self):
-        client = TypeLLMClient(model="fake")  # thinking off for the client
+        client = TypeLLMClient(model="fake")
         client.sglang = FakeServer()
         result = client.generate(context="Receipt", questions={
             "hard": {"type": "boolean", "instructions": "Hard?", "thinking": True},
@@ -128,12 +132,12 @@ class PerFieldThinkingTests(unittest.TestCase):
                    for t in ([p["text"]] if isinstance(p["text"], str) else p["text"])]
         self.assertTrue(any("Easy?" in t and "<think>" not in t for t in answers))
 
-    def test_a_field_can_opt_out_of_the_clients_thinking(self):
-        client = TypeLLMClient(model="fake", thinking=True)
-        client.sglang = FakeServer(thinking=True)
+    def test_thinking_false_is_the_same_as_leaving_it_out(self):
+        client = TypeLLMClient(model="fake")
+        client.sglang = FakeServer()
         client.generate(context="Receipt", questions={
-            "a": {"type": "boolean", "instructions": "A?"},
-            "b": {"type": "boolean", "instructions": "B?"},
+            "a": {"type": "boolean", "instructions": "A?", "thinking": True},
+            "b": {"type": "boolean", "instructions": "B?", "thinking": True},
             "skip": {"type": "boolean", "instructions": "Skip?", "thinking": False},
         })
         prompts = self.thinking_prompts(client.sglang)
@@ -197,8 +201,8 @@ class BatchedThinkingTests(unittest.TestCase):
 
     def test_one_thinking_request_covers_every_prompt_in_a_layer(self):
         client = TypeLLMClient(model="fake")
-        client.sglang = FakeServer(thinking=True)
-        result = client.generate(context="Receipt", questions=self.QUESTIONS)
+        client.sglang = FakeServer()
+        result = client.generate(context="Receipt", questions=thinks(self.QUESTIONS))
         self.assertEqual(result, {"flag": True, "count": 7, "name": "blue", "pick": "x"})
         [think] = client.sglang.requests("think")
         # Four fields plus the reversed ordering of "pick".
@@ -210,19 +214,19 @@ class BatchedThinkingTests(unittest.TestCase):
 
     def test_dag_thinks_once_per_layer(self):
         client = TypeLLMClient(model="fake")
-        client.sglang = FakeServer(thinking=True)
-        client.generate(context="Receipt", questions={
+        client.sglang = FakeServer()
+        client.generate(context="Receipt", questions=thinks({
             "a": {"type": "boolean"}, "b": {"type": "integer"},
             "c": {"type": "boolean", "depends_on": ["a", "b"]},
             "d": {"type": "string", "depends_on": ["a"]},
-        })
+        }))
         self.assertEqual([width(p) for p in client.sglang.requests("think")], [2, 2])
 
     def test_images_count_prompt_tokens_in_one_batch(self):
         client = TypeLLMClient(model="fake")
-        client.sglang = FakeServer(thinking=True)
+        client.sglang = FakeServer()
         client.generate(context="Receipt", images=[PNG],
-                        questions={"a": {"type": "boolean"}, "b": {"type": "boolean"}})
+                        questions=thinks({"a": {"type": "boolean"}, "b": {"type": "boolean"}}))
         counts = [p for p in client.sglang.requests("count") if width(p) > 1]
         self.assertEqual([width(p) for p in counts], [2])
         [think] = client.sglang.requests("think")

@@ -39,7 +39,7 @@ def probe(model):
     row['template_sha256'] = hashlib.sha256(tok.get_chat_template().encode()).hexdigest()
     for thinking in (False, True):
         calls = []
-        client = SGLangClient(thinking=thinking, thinking_budget=64)
+        client = SGLangClient(thinking_budget=64)
         client._chat_tokenizer = tok
         client._context_length_cache = 32768
         # Only the server response is simulated; tokenizer and native templates
@@ -52,9 +52,9 @@ def probe(model):
         try:
             prompt = client.render_chat([{'role': 'user', 'content': 'Context'},
                                         {'role': 'user', 'content': 'Return A.'}],
-                                       add_generation_prompt=True)
+                                       add_generation_prompt=True, thinking=thinking)
             parent = client.complete_chat_prefix(prompt, 'A')
-            child = client.extend_chat_prefix(parent, 'Return B.')
+            child = client.extend_chat_prefix(parent, 'Return B.', thinking=thinking)
             child_history = client.complete_chat_prefix(child, 'B')
             parent_ids = tok.encode(parent, add_special_tokens=False)
             child_ids = tok.encode(child, add_special_tokens=False)
