@@ -271,6 +271,21 @@ class ImageRequestTests(unittest.TestCase):
         self.assertEqual(rest, [])
 
 
+class ImageInputTokenTests(unittest.TestCase):
+    def test_images_count_as_the_server_expands_them(self):
+        client = TypeLLMClient(model="fake-vl")
+        client.sglang = FakeServerClient()
+        questions = {"a": {"type": "boolean"}}
+        client.generate(context="Receipt", images=[PNG], questions=questions)
+        first = client.sglang.generate_payloads[0]["text"]
+        first = first if isinstance(first, str) else first[0]
+        count = client.sglang.count_tokens
+        # The server reported 900 prompt tokens, with the placeholder expanded.
+        image = 900 - count(first) + count(VISION)
+        self.assertEqual(client.last_usage.input_tokens,
+                         count("Receipt") + count('{"a": {"type": "boolean"}}') + image)
+
+
 class RuntimeContentTests(unittest.TestCase):
     def test_fake_backends_receive_image_parts(self):
         class Recording(FakeSGLang):

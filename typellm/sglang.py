@@ -37,7 +37,13 @@ class GenerationCancelled(RuntimeError):
 
 @dataclass
 class Usage:
-    """What SGLang reported for the /generate requests of one generate() call."""
+    """The tokens of one generate() call.
+
+    input_tokens is what the caller sent, each part counted once: the context,
+    the questions or schema as JSON, and the images as the server expands them.
+    The other counts are what SGLang reported for the call's /generate requests,
+    where the shared context is part of every prompt.
+    """
 
     requests: int = 0
     prompt_tokens: int = 0
@@ -45,6 +51,7 @@ class Usage:
     completion_tokens: int = 0
     # The part of completion_tokens that is reasoning, not typed answers.
     thinking_tokens: int = 0
+    input_tokens: int = 0
 
     def _add(self, response: Any) -> None:
         self.requests += 1
@@ -75,6 +82,8 @@ class _CallScope:
     usage: Usage = field(default_factory=Usage)
     deadline: float | None = None  # time.monotonic() when the call runs out of time
     cancel: threading.Event | None = None
+    # Images whose tokens input_tokens still lacks; the first response measures them.
+    unmeasured_images: int = 0
 
     def expired(self) -> bool:
         return self.deadline is not None and time.monotonic() >= self.deadline
@@ -351,7 +360,26 @@ class SGLangClient:
                 raise GenerationTimeout("generate() ran out of time") from exc
             raise
         scope.usage._add(response)
+        if scope.unmeasured_images:
+            self._measure_images(scope, payload, response)
         return response
+
+    def count_tokens(self, text: str) -> int:
+        return len(self._get_chat_tokenizer().encode(text, add_special_tokens=False))
+
+    def _measure_images(self, scope: _CallScope, payload: Mapping[str, Any], response: Any) -> None:
+        """Add the images' tokens to input_tokens: the server's prompt count less the local one."""
+        text = payload.get("text")
+        prompt = text if isinstance(text, str) else text[0] if isinstance(text, list) and text else None
+        item = response[0] if isinstance(response, list) and response else response
+        meta = item.get("meta_info") if isinstance(item, Mapping) else None
+        served = meta.get("prompt_tokens") if isinstance(meta, Mapping) else None
+        if not isinstance(prompt, str) or type(served) is not int:
+            return
+        # The server replaces each placeholder with the image's tokens.
+        placeholders = scope.unmeasured_images * self.count_tokens(self.image_placeholder())
+        scope.usage.input_tokens += max(0, served - self.count_tokens(prompt) + placeholders)
+        scope.unmeasured_images = 0
 
     def _with_images(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         images = self._active_images.get()

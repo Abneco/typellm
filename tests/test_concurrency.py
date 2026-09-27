@@ -1,3 +1,4 @@
+import json
 import pickle
 import sys
 import threading
@@ -104,10 +105,13 @@ class UsageTests(unittest.TestCase):
         self.assertIsNone(client.last_usage)
         client.generate(context="Receipt", questions=self.QUESTIONS)
         n = prompts_sent(client.sglang)
+        # The input counts once, though every prompt carries it.
+        sent = client.sglang.count_tokens("Receipt") + client.sglang.count_tokens(json.dumps(self.QUESTIONS))
         self.assertEqual(client.last_usage, Usage(
             requests=len(client.sglang.payloads),
-            prompt_tokens=10 * n, cached_tokens=4 * n, completion_tokens=n,
+            prompt_tokens=10 * n, cached_tokens=4 * n, completion_tokens=n, input_tokens=sent,
         ))
+        self.assertGreater(client.last_usage.requests, 1)
         client.sglang.payloads.clear()
         client.generate(context="Receipt", questions={"b": {"type": "boolean"}})
         self.assertEqual(client.last_usage.requests, len(client.sglang.payloads))
@@ -136,6 +140,7 @@ class UsageTests(unittest.TestCase):
         with self.assertRaisesRegex(SGLangError, "went away"):
             client.generate(context="Receipt", questions=self.QUESTIONS)
         self.assertEqual(client.last_usage.requests, 2)
+        self.assertGreater(client.last_usage.input_tokens, 0)
         with self.assertRaises(ValueError):
             client.generate(questions=self.QUESTIONS)
         self.assertIsNone(client.last_usage)

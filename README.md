@@ -409,11 +409,14 @@ result = client.generate(
     cancel=cancel,   # set it from another thread; raises GenerationCancelled
 )
 print(client.last_usage)
-# Usage(requests=4, prompt_tokens=1830, cached_tokens=1504, completion_tokens=7, thinking_tokens=0)
+# Usage(requests=4, prompt_tokens=1830, cached_tokens=1504, completion_tokens=7, thinking_tokens=0, input_tokens=410)
 ```
 
-`last_usage` reports the SGLang requests and tokens of the last call made in the
-current thread, including a call that failed partway. A timeout or cancel stops
+`last_usage` reports the tokens of the last call made in the current thread,
+including a call that failed partway. `input_tokens` is what you sent, each part
+counted once: the context, the questions as JSON, and the images. The other
+counts are SGLang's for the call's requests, where every prompt carries the
+shared context. A timeout or cancel stops
 the call before its next SGLang request.
 
 ## Cost analysis

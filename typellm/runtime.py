@@ -395,6 +395,11 @@ class TypeLLMClient:
         with call_scope(timeout, cancel) as scope:
             try:
                 decisions = self.compile_schema(schema)
+                count = getattr(self.sglang, "count_tokens", None)
+                if callable(count):
+                    scope.usage.input_tokens = sum(map(count, (
+                        context, json.dumps(questions if questions is not None else schema, ensure_ascii=False))))
+                    scope.unmeasured_images = len(encoded_images)
                 # Independent fields run together; depends_on turns the fields into a
                 # graph whose layers run in order.
                 run = (_execute_dependency_decisions if any(d.depends_on is not None for d in decisions)
