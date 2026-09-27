@@ -252,9 +252,11 @@ class SGLangClient:
     def _http(self) -> httpx.Client:
         with self._load_lock:
             if self._http_client is None:
-                # Keep-alive connections: one call makes many small requests.
+                # Keep-alive connections: one call makes many small requests. Idle
+                # ones are dropped before SGLang closes them (5 s), so a request
+                # rarely goes out on a connection the server has just closed.
                 self._http_client = httpx.Client(limits=httpx.Limits(
-                    max_connections=None, max_keepalive_connections=64,
+                    max_connections=None, max_keepalive_connections=64, keepalive_expiry=2.0,
                 ))
             return self._http_client
 
@@ -269,24 +271,15 @@ class SGLangClient:
         scope = _call_scope.get()
         timeout = self.timeout if scope is None else scope.socket_timeout(self.timeout)
         try:
-            # Streamed so a failed body read still reports the status it follows.
-            with self._http().stream(
-                "GET" if payload is None else "POST",
-                self.base_url + path,
-                content=body,
-                headers={"Content-Type": "application/json"},
-                timeout=timeout,
-            ) as response:
-                if response.status_code >= 400:
-                    try:
-                        detail = response.read().decode("utf-8", errors="replace")
-                    except httpx.HTTPError as read_error:
-                        detail = f"Could not read error response: {read_error}"
-                    raise SGLangError(
-                        f"SGLang {path} returned HTTP {response.status_code}: {detail}",
-                        status=response.status_code,
-                    )
-                raw = response.read().decode("utf-8")
+            try:
+                raw = self._send(path, payload is None, body, timeout)
+            except (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError):
+                # The connection dropped before an answer, most often a pooled one
+                # the server had just closed. SGLang is fine: try once on a new one.
+                if scope is not None:
+                    scope.check()
+                    timeout = scope.socket_timeout(self.timeout)
+                raw = self._send(path, payload is None, body, timeout)
         except httpx.HTTPError as exc:
             # Connection failures, timeouts, resets and truncated responses.
             raise SGLangError(
@@ -300,6 +293,26 @@ class SGLangClient:
             raise SGLangError(
                 f"SGLang {path} returned non-JSON data: {raw[:500]}"
             ) from exc
+
+    def _send(self, path: str, get: bool, body: bytes | None, timeout: float) -> str:
+        # Streamed so a failed body read still reports the status it follows.
+        with self._http().stream(
+            "GET" if get else "POST",
+            self.base_url + path,
+            content=body,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        ) as response:
+            if response.status_code >= 400:
+                try:
+                    detail = response.read().decode("utf-8", errors="replace")
+                except httpx.HTTPError as read_error:
+                    detail = f"Could not read error response: {read_error}"
+                raise SGLangError(
+                    f"SGLang {path} returned HTTP {response.status_code}: {detail}",
+                    status=response.status_code,
+                )
+            return response.read().decode("utf-8")
 
     @contextmanager
     def images(self, images: Sequence[str]) -> Iterator[None]:

@@ -212,6 +212,38 @@ class DeadlineTests(unittest.TestCase):
             client._generate({"text": "x"})
         self.assertNotIsInstance(caught.exception, GenerationTimeout)
 
+    def dropping(self, error, times):
+        """A client whose server drops the first `times` requests with `error`."""
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            if len(seen) <= times:
+                raise error("connection dropped", request=request)
+            return httpx.Response(200, json={"text": "ok"})
+
+        client = SGLangClient()
+        client._http_client = httpx.Client(transport=httpx.MockTransport(handler))
+        return client, seen
+
+    def test_a_dropped_connection_is_retried_once(self):
+        for error in (httpx.ReadError, httpx.RemoteProtocolError, httpx.WriteError):
+            client, seen = self.dropping(error, 1)
+            with self.subTest(error=error.__name__):
+                self.assertEqual(client._request("/generate", {"text": "x"}), {"text": "ok"})
+                self.assertEqual(len(seen), 2)
+        client, seen = self.dropping(httpx.ReadError, 2)
+        with self.assertRaisesRegex(SGLangError, "Could not reach"):
+            client._request("/generate", {"text": "x"})
+        self.assertEqual(len(seen), 2)
+
+    def test_a_refused_connection_is_not_retried(self):
+        for error in (httpx.ConnectError, httpx.ReadTimeout):
+            client, seen = self.dropping(error, 1)
+            with self.subTest(error=error.__name__), self.assertRaises(SGLangError):
+                client._request("/generate", {"text": "x"})
+            self.assertEqual(len(seen), 1)
+
     def test_invalid_budgets_are_rejected(self):
         class Recording(FakeServer):
             def _request(self, path, payload=None, *, allow_text=False):
