@@ -83,6 +83,30 @@ def width(payload):
     return 1 if isinstance(payload["text"], str) else len(payload["text"])
 
 
+class PrefixWarmupTests(unittest.TestCase):
+    MIXED = {"a": {"type": "integer"}, "b": {"type": "number"}, "n": {"type": "string"},
+             "k": {"type": "string", "enum": ["x", "y"]}}
+
+    def test_the_context_is_warmed_before_any_batch_that_shares_it(self):
+        for thinking in (False, True):
+            with self.subTest(thinking=thinking):
+                client = TypeLLMClient(model="fake")
+                client.sglang = FakeServer(thinking=thinking)
+                client.generate(context="Receipt", questions=self.MIXED)
+                warm = client.sglang.requests("count")
+                self.assertEqual(len(warm), 1)
+                # First, before the thinking, number, text and scoring batches.
+                self.assertIs(client.sglang.payloads[0], warm[0])
+                self.assertIn("Receipt", warm[0]["text"])
+                self.assertNotIn('{"a":', warm[0]["text"])
+
+    def test_open_fields_alone_are_not_warmed(self):
+        client = TypeLLMClient(model="fake")
+        client.sglang = FakeServer()
+        client.generate(context="Receipt", questions={"a": {"type": "integer"}, "n": {"type": "string"}})
+        self.assertEqual(client.sglang.requests("count"), [])
+
+
 class BatchedThinkingTests(unittest.TestCase):
     QUESTIONS = {
         "flag": {"type": "boolean"},

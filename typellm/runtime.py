@@ -758,6 +758,14 @@ def _execute_batch_decisions(
             {label: token_id for label, (token_id, _) in label_tokens.items()},
         )
 
+    # Warm the exact common prefix once, before any batch that shares it: prompts
+    # prefilled in the same batch cannot reuse each other's cache, so thinking,
+    # number and text batches would each prefill the context once per prompt.
+    # SGLang then forks the cached state; TypeLLM never reads or moves KV tensors.
+    if finite_indexes and not incremental:
+        cache_meta = client.cache_prefix(shared_prefix)
+        LOG.info("batch_shared_prefix_cached_tokens=%s", cache_meta.get("cached_tokens"))
+
     ready = client.prepare_answer_prefixes(raw_prompts) if defer else raw_prompts
     prompts = [ready[decision_slots[index]] for index in finite_indexes]
     scoring_prompts = [ready[slot] + prefill for slot, prefill in zip(scoring_slots, scoring_prefills)]
@@ -796,12 +804,7 @@ def _execute_batch_decisions(
             completed = complete(prompt, messages, _closed_answer(decision, json.dumps(value, ensure_ascii=False)))
             open_results[index] = (open_row(decision, value), completed)
 
-    # Warm the exact common prefix once, then let SGLang fork the cached state
-    # across the K batched prompts. TypeLLM never reads or moves KV tensors.
     if prompts:
-        if not incremental:
-            cache_meta = client.cache_prefix(shared_prefix)
-            LOG.info("batch_shared_prefix_cached_tokens=%s", cache_meta.get("cached_tokens"))
         scored, elapsed = client.score_candidates_batch(scoring_prompts, scoring_ids)
         grouped_scores = []
         offset = 0
