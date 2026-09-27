@@ -1,9 +1,12 @@
+import json
+import random
 import unittest
 
 import httpx
 
 from typellm.runtime import numeric_pattern
 from typellm import (
+    GenerationTimeout,
     SGLangClient,
     SGLangError,
     SchemaError,
@@ -906,6 +909,119 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         self.assertEqual(payload["token_ids_logprob"], [[65, 66], [65, 66]])
         self.assertEqual(scored[0][0], {65: -0.1, 66: -2.0})
         self.assertEqual(scored[1][0], {65: -3.0, 66: -0.2})
+
+
+class HostedApiTests(unittest.TestCase):
+    def client(self, handler, **options):
+        client = TypeLLMClient(api_key="k", **options)
+        client._transport = httpx.MockTransport(handler)
+        return client
+
+    def test_a_call_is_one_request_to_the_hosted_api(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200, json={
+                "id": "gen_1", "model": "typellm-latest", "result": {"total": 12.5},
+                "thinking": {"total": "The receipt says 12.50."},
+                "usage": {"input_tokens": 40, "thinking_tokens": 9}, "elapsed": 0.5,
+            })
+
+        client = self.client(handler, seed=7)
+        questions = {"total": {"type": "number", "thinking": True}}
+        image = "data:image/png;base64,iVBORw0KGgo="
+        result = client.generate(context="Total: 12.50", questions=questions, images=[image], timeout=90)
+
+        self.assertEqual(result, {"total": 12.5})
+        [request] = seen
+        self.assertEqual(str(request.url), "https://api.typellm.ai/v1/generate")
+        self.assertEqual(request.headers["authorization"], "Bearer k")
+        self.assertEqual(json.loads(request.content), {
+            "context": "Total: 12.50", "questions": questions, "images": [image], "timeout": 90,
+            # Each call draws its seed from the client's seeded stream.
+            "options": {"mode": "argmax", "seed": random.Random(7).randrange(2**32)},
+        })
+        self.assertEqual((client.last_usage.input_tokens, client.last_usage.thinking_tokens), (40, 9))
+        self.assertEqual(client.last_thinking, {"total": "The receipt says 12.50."})
+
+    def test_hosted_temperature_only_applies_to_sampling(self):
+        bodies = []
+
+        def handler(request):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={
+                "result": {"a": True}, "usage": {"input_tokens": 1, "thinking_tokens": 0},
+            })
+
+        self.client(handler, temperature=0).generate(
+            context="x", questions={"a": {"type": "boolean"}})
+        self.client(handler, mode="sample", temperature=0.7).generate(
+            context="x", questions={"a": {"type": "boolean"}})
+
+        self.assertNotIn("temperature", bodies[0]["options"])
+        self.assertEqual(bodies[1]["options"]["temperature"], 0.7)
+
+    def test_constructor_timeout_sets_hosted_limit_with_per_call_override(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200, json={
+                "result": {"a": True}, "usage": {"input_tokens": 1, "thinking_tokens": 0},
+            })
+
+        questions = {"a": {"type": "boolean"}}
+        client = self.client(handler, timeout=240)
+        client.generate(context="x", questions=questions)
+        client.generate(context="x", questions=questions, timeout=30)
+        self.client(handler).generate(context="x", questions=questions)
+
+        self.assertEqual([json.loads(request.content).get("timeout") for request in seen],
+                         [240, 30, None])
+        self.assertEqual([request.extensions["timeout"]["read"] for request in seen],
+                         [300, 90, 180])
+        self.assertEqual(TypeLLMClient().sglang.timeout, 120)
+
+    def test_hosted_rejects_invalid_timeouts_before_sending(self):
+        sent = []
+        client = self.client(lambda request: sent.append(request))
+        questions = {"a": {"type": "boolean"}}
+
+        for timeout in (0, -1, True, "5", float("nan")):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                client.generate(context="x", questions=questions, timeout=timeout)
+        with self.assertRaises(ValueError):
+            self.client(lambda request: sent.append(request), timeout=0).generate(
+                context="x", questions=questions)
+        self.assertEqual(sent, [])
+
+    def test_api_errors_keep_their_status(self):
+        for status, error in ((401, SGLangError), (429, SGLangError), (504, GenerationTimeout)):
+            client = self.client(lambda request: httpx.Response(status, json={"error": {"message": "no"}}))
+            with self.assertRaises(error) as caught:
+                client.generate(context="x", questions={"a": {"type": "boolean"}})
+            self.assertEqual(caught.exception.status, status)
+        with self.assertRaises(ValueError):  # only local compilation takes a raw schema
+            client.generate(context="x", schema={"type": "object", "properties": {"a": {"type": "boolean"}}})
+
+    def test_hosted_compile_schema_requires_own_server(self):
+        client = TypeLLMClient(api_key="k")
+        with self.assertRaisesRegex(ValueError, "compile_schema needs your own server"):
+            client.compile_schema({"type": "object", "properties": {"a": {"type": "boolean"}}})
+
+    def test_hosted_invalid_responses_fail_clearly(self):
+        questions = {"a": {"type": "boolean"}}
+        client = TypeLLMClient(api_key="k")
+        for response in (httpx.Response(200, text="not JSON"),
+                         httpx.Response(200, json={"result": {"a": True}}),
+                         httpx.Response(302, headers={"Location": "/elsewhere"})):
+            with self.subTest(status=response.status_code):
+                client._transport = httpx.MockTransport(lambda request: response)
+                with self.assertRaises(SGLangError) as caught:
+                    client.generate(context="x", questions=questions)
+                self.assertEqual(caught.exception.status, response.status_code)
+
 
 if __name__ == "__main__":
     unittest.main()
