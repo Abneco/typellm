@@ -8,8 +8,8 @@ import math
 import os
 import random
 import threading
-import warnings
 import time
+import warnings
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -480,7 +480,7 @@ class TypeLLMClient:
     def _generate_hosted(self, context: str, questions: Mapping[str, Any], images: Sequence[str],
                          mode: str, temperature: float, seed: int | None,
                          timeout: float | None) -> Generation:
-        """One POST /v1/generate. HTTP errors carry their status in SGLangError."""
+        """Run the call on the hosted API. HTTP errors carry their status in SGLangError."""
         active_timeout = self.timeout if timeout is None else timeout
         if active_timeout is not None and (type(active_timeout) not in (int, float) or
                                            not active_timeout > 0):
@@ -533,12 +533,13 @@ class TypeLLMClient:
         return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens))
 
     def _post_hosted(self, body: dict[str, Any], timeout: float) -> httpx.Response:
-        """POST /v1/generate, retrying a 429, a 5xx other than 504 or a connection
-        error. A timeout, the socket's or the service's 504, is final: the call has
-        had its time."""
+        """POST /v1/generate, retrying a 429, a 5xx other than 504 or a connection error.
+
+        A timeout, the socket's or the service's 504, is final: the call has had its time.
+        """
+        attempt = 0
         with httpx.Client(transport=self._transport) as http:
-            for attempt in range(self.max_retries + 1):
-                retry_after = None
+            while True:
                 try:
                     response = http.post(self.base_url + "/v1/generate", json=body, timeout=timeout,
                                          headers={"Authorization": f"Bearer {self.api_key}"})
@@ -546,7 +547,7 @@ class TypeLLMClient:
                     if attempt == self.max_retries or isinstance(exc, httpx.TimeoutException):
                         raise SGLangError(
                             f"Could not reach the TypeLLM API at {self.base_url}: {exc!r}") from exc
-                    problem = repr(exc)
+                    problem, retry_after = repr(exc), None
                 else:
                     status = response.status_code
                     if attempt == self.max_retries or not (status == 429 or (status >= 500 and status != 504)):
@@ -557,9 +558,10 @@ class TypeLLMClient:
                 except ValueError:
                     delay = 0.0
                 if not 0 < delay <= 60:  # else 0.5 s, 1 s, 2 s ... 8 s, less up to 25% jitter
-                    delay = min(0.5 * 2**attempt, 8.0) * (1 - 0.25 * random.random())
+                    delay = 0.5 * 2 ** min(attempt, 4) * (1 - 0.25 * random.random())
                 LOG.info("TypeLLM API call failed (%s); retrying in %.2f s", problem, delay)
                 time.sleep(delay)
+                attempt += 1
 
 
 def candidate_softmax(

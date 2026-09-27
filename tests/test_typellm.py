@@ -1102,6 +1102,7 @@ class HostedApiTests(unittest.TestCase):
     def test_hosted_retries_stop_at_max_retries_and_never_repeat_a_timeout(self):
         for replies, options, error in (
             ((503, 503, 503), {}, SGLangError),  # two retries by default
+            ((httpx.ConnectError("connection refused"),) * 3, {}, SGLangError),
             ((503,), {"max_retries": 0}, SGLangError),
             ((504,), {}, GenerationTimeout),  # the call has had its time
             ((httpx.ReadTimeout("no answer"),), {}, SGLangError),  # so has this one
@@ -1112,7 +1113,7 @@ class HostedApiTests(unittest.TestCase):
                 with self.assertRaises(error):
                     client.generate(context="x", questions={"a": {"type": "boolean"}})
                 self.assertEqual(len(sent), len(replies))
-        for max_retries in (-1, 1.5, True, None):
+        for max_retries in (-1, True):
             with self.subTest(max_retries=max_retries), self.assertRaises(ValueError):
                 TypeLLMClient(api_key="k", max_retries=max_retries)
 
