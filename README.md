@@ -242,7 +242,9 @@ result = client.generate(context=context, questions={
 ```
 
 A field's `thinking` and `thinking_budget` override the client's; `"thinking":
-False` keeps one field out of a thinking client.
+False` keeps one field out of a thinking client. After a call,
+`client.last_thinking` maps each field that thought to its reasoning, and
+`client.last_usage.thinking_tokens` counts the reasoning tokens.
 
 Models with always-on thinking still reason with `thinking=False`;
 `thinking_budget` applies to them too. See [Supported models](#supported-models).
@@ -416,7 +418,7 @@ result = client.generate(
     cancel=cancel,   # set it from another thread; raises GenerationCancelled
 )
 print(client.last_usage)
-# Usage(requests=4, prompt_tokens=1830, cached_tokens=1504, completion_tokens=7)
+# Usage(requests=4, prompt_tokens=1830, cached_tokens=1504, completion_tokens=7, thinking_tokens=0)
 ```
 
 `last_usage` reports the SGLang requests and tokens of the last call made in the

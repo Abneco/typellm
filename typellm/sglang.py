@@ -43,6 +43,8 @@ class Usage:
     prompt_tokens: int = 0
     cached_tokens: int = 0
     completion_tokens: int = 0
+    # The part of completion_tokens that is reasoning, not typed answers.
+    thinking_tokens: int = 0
 
     def _add(self, response: Any) -> None:
         self.requests += 1
@@ -54,6 +56,18 @@ class Usage:
                 value = meta.get(name)
                 if type(value) is int:
                     setattr(self, name, getattr(self, name) + value)
+
+
+def _count_thinking(response: Any) -> None:
+    """Add a thinking request's generated tokens to this call's usage."""
+    scope = _call_scope.get()
+    if scope is None:
+        return
+    for item in response if isinstance(response, list) else [response]:
+        meta = item.get("meta_info") if isinstance(item, Mapping) else None
+        tokens = meta.get("completion_tokens") if isinstance(meta, Mapping) else None
+        if type(tokens) is int:
+            scope.usage.thinking_tokens += tokens
 
 
 @dataclass
@@ -508,6 +522,16 @@ class SGLangClient:
         return (self._prepare_answer_prefix(prompt, *_overrides(thinking, thinking_budget))
                 if finish_thinking else prompt)
 
+    def thinking_text(self, prompt: str, finished: str) -> str | None:
+        """The reasoning that finishing thinking added to prompt, or None."""
+        if finished == prompt or not finished.startswith(prompt):
+            return None
+        added = finished[len(prompt):]
+        close = detect_protocol(self._get_chat_tokenizer()).thinking_close
+        if close and close in added:
+            added = added[:added.index(close)]
+        return added.strip() or None
+
     def prepare_answer_prefixes(
         self,
         prefixes: Sequence[str],
@@ -562,6 +586,7 @@ class SGLangClient:
     def _finish_thinking(self, prefix: str, budget: int | None = None) -> str:
         params, image_tokens = self._thinking_params(prefix, budget=budget)
         response = self._generate({"text": prefix, "sampling_params": params})
+        _count_thinking(response)
         return self._complete_thinking(prefix, response, image_tokens)
 
     def _finish_thinking_batch(self, prefixes: Sequence[str],
@@ -585,6 +610,7 @@ class SGLangClient:
         })
         if not isinstance(response, list) or len(response) != len(prefixes):
             raise SGLangError("Unexpected thinking batch response shape")
+        _count_thinking(response)
         return [self._complete_thinking(prefix, item, image_tokens)
                 for prefix, item, (_, image_tokens) in zip(prefixes, response, planned)]
 

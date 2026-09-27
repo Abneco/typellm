@@ -186,22 +186,32 @@ class TypeLLMClient:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"typellm_last_usage_{id(self)}", default=None
         )
+        self._last_thinking: ContextVar[dict[str, str]] = ContextVar(
+            f"typellm_last_thinking_{id(self)}", default={}
+        )
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         del state["_last_prompts"]
         del state["_last_usage"]
+        del state["_last_thinking"]
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._last_prompts = ContextVar(f"typellm_last_prompts_{id(self)}", default=[])
         self._last_usage = ContextVar(f"typellm_last_usage_{id(self)}", default=None)
+        self._last_thinking = ContextVar(f"typellm_last_thinking_{id(self)}", default={})
 
     @property
     def last_prompts(self) -> list[str]:
         """Final prompts of the last generate() call made in this thread or task."""
         return self._last_prompts.get()
+
+    @property
+    def last_thinking(self) -> dict[str, str]:
+        """Reasoning of the fields that thought in the last call in this thread or task."""
+        return self._last_thinking.get()
 
     @property
     def last_usage(self) -> Usage | None:
@@ -366,6 +376,7 @@ class TypeLLMClient:
         Both stop the call before its next request to SGLang.
         """
         self._last_usage.set(None)
+        self._last_thinking.set({})
         if (context is None) == (state is None):
             raise ValueError("provide exactly one of context or state")
         context = state if state is not None else context
@@ -400,6 +411,8 @@ class TypeLLMClient:
             finally:
                 self._last_usage.set(scope.usage)
         self._last_prompts.set(prompts)
+        self._last_thinking.set({decision.name: row["thinking"] for decision, row in zip(decisions, rows)
+                                 if row.get("thinking")})
 
         output: dict[str, Any] = {}
         for decision, row in zip(decisions, rows):
@@ -877,6 +890,7 @@ def _execute_batch_decisions(
 
     if open_results:
         finite_rows = iter(zip(results, completed_prompts))
+
         merged_results: list[dict] = []
         merged_prompts: list[str] = []
         for index in range(len(decisions)):
@@ -887,6 +901,11 @@ def _execute_batch_decisions(
             merged_results.append(row)
             merged_prompts.append(prompt)
         results, completed_prompts = merged_results, merged_prompts
+    # Each field's reasoning, when it thought: what finishing thinking added.
+    read = getattr(client, "thinking_text", None)
+    for index, row in enumerate(results):
+        slot = decision_slots[index]
+        row["thinking"] = read(raw_prompts[slot], ready[slot]) if callable(read) and defer else None
     return results, completed_prompts
 
 

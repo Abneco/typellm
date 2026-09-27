@@ -155,6 +155,30 @@ class PerFieldThinkingTests(unittest.TestCase):
                    for t, params in zip(request["text"], request["sampling_params"])}
         self.assertEqual(budgets, {"Short?": 100, "Long?": 300, "Default?": 500})
 
+    def test_reasoning_and_its_tokens_are_reported_per_field(self):
+        class Metered(FakeServer):
+            def _request(self, path, payload=None, *, allow_text=False):
+                response = super()._request(path, payload, allow_text=allow_text)
+                if path == "/generate":
+                    params = payload["sampling_params"]
+                    thinking = (params[0] if isinstance(params, list) else params).get("stop") == [THINK_STOP]
+                    for item in response if isinstance(response, list) else [response]:
+                        item["meta_info"]["completion_tokens"] = 40 if thinking else 1
+                return response
+
+        client = TypeLLMClient(model="fake")
+        client.sglang = Metered()
+        client.generate(context="Receipt", questions={
+            "hard": {"type": "boolean", "instructions": "Hard?", "thinking": True},
+            "easy": {"type": "boolean", "instructions": "Easy?"},
+        })
+        self.assertEqual(client.last_thinking, {"hard": "Reasoned."})
+        self.assertEqual(client.last_usage.thinking_tokens, 40)
+        self.assertGreater(client.last_usage.completion_tokens, 40)  # answers count too
+        with self.assertRaises(ValueError):
+            client.generate(questions={"x": {"type": "boolean"}})
+        self.assertEqual(client.last_thinking, {})
+
     def test_invalid_settings_are_schema_errors(self):
         from typellm import SchemaError
         for field in ({"type": "boolean", "thinking": "yes"}, {"type": "boolean", "thinking_budget": 0},
