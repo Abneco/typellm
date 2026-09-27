@@ -850,6 +850,44 @@ class SGLangClient:
             results.append((scores, meta if isinstance(meta, Mapping) else {}))
         return results, elapsed
 
+    def generate_numbers(
+        self,
+        prefixes: Sequence[str],
+        patterns: Sequence[str],
+        max_new_tokens: int,
+        *,
+        temperature: float = 0,
+        seed: int = 0,
+    ) -> list[str]:
+        """Generate one regex-constrained value per prompt in a native batch.
+
+        SGLang masks every step to the pattern, so a number takes one request
+        instead of one per token. Returns the raw generated text.
+        """
+        if len(prefixes) != len(patterns):
+            raise ValueError("prefixes and patterns must have the same length")
+        if not prefixes:
+            return []
+        params = [{"max_new_tokens": max_new_tokens, "temperature": temperature,
+                   "top_p": 1.0, "top_k": -1, "min_p": 0.0,
+                   "sampling_seed": seed + i, "regex": pattern}
+                  for i, pattern in enumerate(patterns)]
+        response = self._generate({"text": list(prefixes), "sampling_params": params})
+        if isinstance(response, Mapping) and len(prefixes) == 1:
+            response = [response]
+        if not isinstance(response, list) or len(response) != len(prefixes):
+            raise SGLangError("Unexpected number batch response shape")
+        texts = []
+        for item in response:
+            meta = item.get("meta_info", {}) if isinstance(item, Mapping) else {}
+            finish = meta.get("finish_reason", {}) if isinstance(meta, Mapping) else {}
+            kind = finish.get("type") if isinstance(finish, Mapping) else finish
+            text = item.get("text") if isinstance(item, Mapping) else None
+            if kind != "stop" or not isinstance(text, str):
+                raise SGLangError(f"Number generation did not complete normally: {finish!r}")
+            texts.append(text)
+        return texts
+
     def generate_texts(
         self,
         prefixes: Sequence[str],
@@ -858,7 +896,8 @@ class SGLangClient:
         temperature: float = 0,
         seed: int = 0,
         after_key: bool = False,
-    ) -> list[str]:
+        nullable: Sequence[bool] | None = None,
+    ) -> list[str | None]:
         """Generate JSON strings in a native batch, then validate every value.
 
         With after_key, every prompt ends with '{"name":', and the model writes the
@@ -870,17 +909,25 @@ class SGLangClient:
         """
         if len(prefixes) != len(max_lengths):
             raise ValueError("prefixes and max_lengths must have the same length")
+        nullable = [False] * len(prefixes) if nullable is None else list(nullable)
+        if len(nullable) != len(prefixes):
+            raise ValueError("prefixes and nullable must have the same length")
+        if any(nullable) and not after_key:
+            raise ValueError("nullable text needs the prefilled '{\"name\":' prompt")
         if not prefixes:
             return []
         params = []
-        for limit in max_lengths:
+        for limit, can_be_null in zip(max_lengths, nullable):
             budget = self.text_max_tokens
             if after_key:
                 # End with the object's closing brace too: models close {"name": "text"}
                 # with the single token '"}', which a bare '"' would rule out. A
                 # length-bounded regex is several times slower, so the limit is
                 # applied by truncation below instead.
-                constraint = {"regex": ' ?"' + _JSON_STRING_CHAR + '*"\\}'}
+                value = '"' + _JSON_STRING_CHAR + '*"'
+                # A nullable field may write null instead, in the same request.
+                value = f"(?:{value}|null)" if can_be_null else value
+                constraint = {"regex": " ?" + value + "\\}"}
                 if limit is not None:
                     # Every token holds at least one character, besides the quotes.
                     budget = min(budget, limit + 3)
@@ -896,13 +943,18 @@ class SGLangClient:
             response = [response]
         if not isinstance(response, list) or len(response) != len(prefixes):
             raise SGLangError("Unexpected text batch response shape")
-        values = []
-        for item, limit in zip(response, max_lengths):
+        values: list[str | None] = []
+        for item, limit, can_be_null in zip(response, max_lengths, nullable):
             if not isinstance(item, Mapping):
                 raise SGLangError("Invalid text response")
             meta = item.get("meta_info", {})
             finish = meta.get("finish_reason", {}) if isinstance(meta, Mapping) else {}
             kind = finish.get("type") if isinstance(finish, Mapping) else finish
+            if can_be_null and isinstance(item.get("text"), str) and item["text"].lstrip().startswith("null"):
+                if kind != "stop":
+                    raise SGLangError(f"Text generation did not complete normally: {finish!r}")
+                values.append(None)
+                continue
             # With a max length, running out of tokens mid-string is a truncation.
             truncated = after_key and limit is not None and kind == "length"
             if kind != "stop" and not truncated:

@@ -29,7 +29,17 @@ class NullServer(FakeServer):
                     out.append({"meta_info": {"output_token_ids_logprobs": [
                         [[0.0 if t == pick else -9.0, t, "?"] for t in ids]]}})
                 return out[0] if isinstance(payload["text"], str) else out
+        if path == "/generate" and any("regex" in p for p in _params(payload)):
+            self.payloads.append(payload)
+            out = [{"text": " null}" if "null" in p["regex"] else ' "blue"}',
+                    "meta_info": {"finish_reason": {"type": "stop"}}} for p in _params(payload)]
+            return out[0] if isinstance(payload["text"], str) else out
         return super()._request(path, payload, allow_text=allow_text)
+
+
+def _params(payload):
+    params = payload.get("sampling_params", {})
+    return params if isinstance(params, list) else [params]
 
 
 class CompileTests(unittest.TestCase):
@@ -53,7 +63,7 @@ class CompileTests(unittest.TestCase):
 
 class RuntimeTests(unittest.TestCase):
     def test_nullable_number_can_answer_null(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = NullServer()
         result = client.generate(context="Receipt", questions={
             "tip": {"type": ["number", "null"]}, "count": {"type": "integer"},
@@ -62,7 +72,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("Return null only if there is no value.", client.last_prompts[0])
 
     def test_nullable_string_decides_null_before_writing(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = NullServer()
         result = client.generate(context="Receipt", questions={
             "note": {"type": ["string", "null"], "maxLength": 20}, "name": {"type": "string"},
@@ -75,7 +85,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(text["text"][0].endswith('{"name":'))
 
     def test_nullable_boolean_scores_null_as_a_choice(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = FakeSGLang(selected_ids=[ord("C")])
         result = client.generate(context="Receipt", questions={
             "paid": {"type": ["boolean", "null"], "return_probabilities": True},
@@ -84,7 +94,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(set(result["paid"]["probabilities"]), {True, False, None})
 
     def test_dependents_see_null(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = NullServer()
         client.generate(context="Receipt", questions={
             "tip": {"type": ["number", "null"]},

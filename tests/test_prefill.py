@@ -30,14 +30,14 @@ class PrefillTests(unittest.TestCase):
         "paid": {"type": "boolean"},
     }
 
-    def run_generate(self, questions, **kwargs):
-        client = TypeLLMClient(model="fake")
+    def run_generate(self, questions, open_decoding="grammar", **kwargs):
+        client = TypeLLMClient(model="fake", open_decoding=open_decoding)
         client.sglang = FakeServer()
         result = client.generate(context="Receipt", questions=questions, **kwargs)
         return client, result
 
     def test_open_fields_continue_from_a_prefilled_key(self):
-        client, result = self.run_generate(self.QUESTIONS)
+        client, result = self.run_generate(self.QUESTIONS, open_decoding="stepwise")
         self.assertEqual(result, {"total": 7, "item": "blue", "paid": True})
         [text] = [p for p in client.sglang.payloads if not isinstance(p["sampling_params"], dict)
                   and "regex" in p["sampling_params"][0]]
@@ -58,7 +58,7 @@ class PrefillTests(unittest.TestCase):
         self.assertIn('{"item": "blue"}', client.last_prompts[1])
 
     def test_numbers_can_end_at_the_closing_brace(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = CloseBraceServer()
         result = client.generate(context="Receipt", questions={"total": {"type": "integer"}})
         self.assertEqual(result, {"total": 7})

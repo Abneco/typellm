@@ -196,8 +196,15 @@ class TypeLLMClient:
         thinking: bool = False,
         thinking_budget: int | None = None,
         text_max_tokens: int = 512,
+        open_decoding: str = "grammar",
     ) -> None:
         _validate_decoding(mode, temperature)
+        if open_decoding not in OPEN_DECODINGS:
+            raise ValueError(f"open_decoding must be one of {OPEN_DECODINGS}")
+        # "grammar": SGLang decodes each number, and a nullable string's null, in
+        # one constrained request. "stepwise": TypeLLM scores every token itself,
+        # among only the tokenizer's canonical starts; one request per token.
+        self.open_decoding = open_decoding
         if type(numeric_max_digits) is not int or numeric_max_digits <= 0:
             raise ValueError("numeric_max_digits must be a positive integer")
         self.sglang = SGLangClient(
@@ -430,6 +437,7 @@ class TypeLLMClient:
                         self.sglang, context, decisions, active_mode,
                         active_temperature, rng, self.numeric_max_digits,
                         image_count=len(encoded_images),
+                        open_decoding=self.open_decoding,
                     )
             finally:
                 self._last_usage.set(scope.usage)
@@ -606,6 +614,62 @@ def _parse_numeric_value(text: str, decision: Choice) -> int | float:
             f"for {decision.name!r}"
         )
     return value
+
+
+OPEN_DECODINGS = ("grammar", "stepwise")
+
+
+def numeric_pattern(numeric_type: str, max_digits: int, nullable: bool = False) -> str:
+    """The regex a grammar backend decodes a prefilled number with, after '{"name":'.
+
+    It admits what the stepwise decoder admits: an optional sign, no leading
+    zeros, no exponent, at most max_digits digits in all; the value ends with
+    the object's '}' or the end of the message.
+    """
+    if numeric_type == "integer":
+        body = "(?:0|[1-9][0-9]{0,%d})" % (max_digits - 1)
+    else:
+        options = []
+        for size in range(1, max_digits + 1):
+            integer = "[0-9]" if size == 1 else "[1-9][0-9]{%d}" % (size - 1)
+            room = max_digits - size
+            options.append(integer + (r"(?:\.[0-9]{1,%d})?" % room if room else ""))
+        body = "(?:" + "|".join(options) + ")"
+    value = "-?" + body
+    if nullable:
+        value = f"(?:{value}|null)"
+    return " ?" + value + r"\}?"
+
+
+def _generate_numeric_batch(
+    client: SGLangClient,
+    items: Sequence[tuple[str, Choice]],
+    mode: str,
+    temperature: float,
+    rng: random.Random,
+    max_digits: int,
+) -> list[tuple[int | float | None, str, str]]:
+    """Decode prefilled numeric fields in one grammar-constrained batch request."""
+    patterns = [numeric_pattern(d.numeric_type or "", max_digits, d.nullable) for _, d in items]
+    texts = client.generate_numbers(
+        [prompt for prompt, _ in items], patterns,
+        # Digits, sign, point and the closing brace; tokens hold one or more characters.
+        max_new_tokens=max_digits + 4,
+        temperature=0 if mode == "argmax" else temperature,
+        seed=rng.randrange(2**31),
+    )
+    outputs = []
+    for (prompt, decision), raw in zip(items, texts):
+        text = raw.strip()
+        if text.endswith("}"):
+            text = text[:-1].rstrip()
+        if decision.nullable and text == "null":
+            outputs.append((None, prompt + " null}", "null"))
+            continue
+        value = _parse_numeric_value(text, decision)
+        LOG.info("numeric name=%s grammar_text=%r value=%r", decision.name, raw, value)
+        outputs.append((value, prompt + " " + text + "}", text))
+    return outputs
 
 
 def _decode_numeric_batch(
@@ -822,7 +886,7 @@ def _mean_order_probabilities(scored, orders, label_tokens, temperature):
 
 def _execute_dependency_decisions(
     client, context, decisions, mode, temperature, rng, numeric_max_digits,
-    image_count=0,
+    image_count=0, open_decoding="grammar",
 ):
     rows_by_name = {}
     prompts_by_name = {}
@@ -850,6 +914,7 @@ def _execute_dependency_decisions(
             dependency_values=dependency_values,
             parent_prefixes=parent_prefixes,
             image_count=image_count,
+            open_decoding=open_decoding,
         )
         for decision, row, prompt in zip(layer, rows, prompts):
             rows_by_name[decision.name] = row
@@ -869,7 +934,11 @@ def _execute_batch_decisions(
     dependency_values: Mapping[str, Mapping[str, Any]] | None = None,
     parent_prefixes: Mapping[str, str] | None = None,
     image_count: int = 0,
+    open_decoding: str = "grammar",
 ) -> tuple[list[dict], list[str]]:
+    # Grammar decoding needs a client that can run constrained generation.
+    grammar = open_decoding == "grammar" and callable(getattr(client, "generate_numbers", None))
+
     def question_content(decision):
         content = decision.opening_text()
         values = (dependency_values or {}).get(decision.name, {})
@@ -977,7 +1046,10 @@ def _execute_batch_decisions(
 
     open_pending = [(index, decision, messages, ready[decision_slots[index]])
                     for index, decision, messages in numeric_pending + text_pending]
-    nullable = [item for item in open_pending if item[1].nullable and item[1].text_type]
+    # With grammar decoding a nullable string writes null or the string in one
+    # request; stepwise first weighs null against every way a string starts.
+    nullable = [item for item in open_pending if item[1].nullable and item[1].text_type
+                and not (grammar and item[1].answer_prefill)]
     if nullable:
         nulls = _decide_nulls(
             client, [(prompt + decision.answer_prefill, decision) for _, decision, _, prompt in nullable],
@@ -991,10 +1063,10 @@ def _execute_batch_decisions(
     text_pending = [item for item in open_pending if item[1].text_type]
 
     if numeric_pending:
-        decoded = _decode_numeric_batch(
-            client,
-            [(prompt + decision.answer_prefill, decision) for _, decision, _, prompt in numeric_pending],
-            mode, temperature, rng, numeric_max_digits,
+        items = [(prompt + decision.answer_prefill, decision) for _, decision, _, prompt in numeric_pending]
+        by_grammar = grammar and all(decision.answer_prefill for _, decision in items)
+        decoded = (_generate_numeric_batch if by_grammar else _decode_numeric_batch)(
+            client, items, mode, temperature, rng, numeric_max_digits,
         )
         for (index, decision, messages, prompt), (value, _completed, generated_text) in zip(numeric_pending, decoded):
             open_results[index] = (open_row(decision, value),
@@ -1009,6 +1081,9 @@ def _execute_batch_decisions(
             temperature=0 if mode == "argmax" else temperature,
             seed=rng.randrange(2**31),
             after_key=all(decision.answer_prefill for _, decision, _, _ in text_pending),
+            # Only fields the null step above did not already decide.
+            **({"nullable": [grammar and decision.nullable for _, decision, _, _ in text_pending]}
+               if grammar and any(decision.nullable for _, decision, _, _ in text_pending) else {}),
         )
         for (index, decision, messages, prompt), value in zip(text_pending, values):
             completed = complete(prompt, messages, _closed_answer(decision, json.dumps(value, ensure_ascii=False)))
@@ -1122,6 +1197,7 @@ def run_schema(
     thinking: bool = False,
     thinking_budget: int | None = None,
     text_max_tokens: int = 512,
+    open_decoding: str = "grammar",
     print_final_prompt: bool = False,
 ) -> dict[str, Any]:
     client = TypeLLMClient(
@@ -1136,6 +1212,7 @@ def run_schema(
         thinking=thinking,
         thinking_budget=thinking_budget,
         text_max_tokens=text_max_tokens,
+        open_decoding=open_decoding,
     )
     return client.generate(
         context=context,

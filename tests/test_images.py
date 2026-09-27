@@ -99,6 +99,12 @@ class FakeServerClient(SGLangClient):
         self.generate_payloads.append(payload)
         texts = [payload["text"]] if isinstance(payload["text"], str) else payload["text"]
         ids = payload.get("token_ids_logprob")
+        params = payload.get("sampling_params")
+        params = params if isinstance(params, list) else [params or {}] * len(texts)
+        if ids is None and any("regex" in p for p in params):
+            # Grammar-decoded open fields: numbers answer 0, strings "x".
+            return [{"text": " 0}" if p["regex"].startswith((" ?-?", " ?(?:-?")) else ' "x"}',
+                     "meta_info": {"finish_reason": {"type": "stop"}}} for p in params]
         if ids is None:
             return [{"meta_info": {"prompt_tokens": 900}} for _ in texts]
         ids = [ids] if isinstance(ids[0], int) else ids

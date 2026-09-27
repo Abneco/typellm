@@ -15,6 +15,11 @@ class ThinkingTokenizer(VisionTokenizer):
         return rendered + ("<think>\n" if add_generation_prompt and enable_thinking else "")
 
 
+def is_number_pattern(pattern):
+    """Whether a regex is typellm's numeric one rather than the string one."""
+    return pattern.startswith((" ?-?", " ?(?:-?"))
+
+
 class FakeServer(SGLangClient):
     """A real SGLangClient whose HTTP layer answers like SGLang.
 
@@ -51,8 +56,10 @@ class FakeServer(SGLangClient):
         elif params[0].get("stop") == [THINK_STOP]:
             out = [{"text": "Reasoned." + THINK_STOP, "meta_info": {}} for _ in texts]
         elif "regex" in params[0]:
-            # The prompt ends with '{"name":'; the quote, the characters and '"}' follow.
-            out = [{"text": ' "blue"}', "meta_info": {"finish_reason": {"type": "stop"}}} for _ in texts]
+            # The prompt ends with '{"name":'; a number's digits, or a string's quote,
+            # characters and '"}' follow.
+            out = [{"text": " 7}" if is_number_pattern(p["regex"]) else ' "blue"}',
+                    "meta_info": {"finish_reason": {"type": "stop"}}} for p in params]
         elif "json_schema" in params[0]:
             out = []
             for p in params:
@@ -80,7 +87,7 @@ def width(payload):
 
 class NumericLockstepTests(unittest.TestCase):
     def test_numbers_share_one_request_per_digit_step(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = FakeServer()
         result = client.generate(context="Receipt", questions={
             "a": {"type": "integer"}, "b": {"type": "number"}, "c": {"type": "integer"},
@@ -90,7 +97,7 @@ class NumericLockstepTests(unittest.TestCase):
         self.assertEqual([width(p) for p in client.sglang.requests("score")], [3, 3, 3])
 
     def test_a_single_number_keeps_single_requests(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = FakeServer()
         client.generate(context="Receipt", questions={"a": {"type": "integer"}})
         self.assertEqual([width(p) for p in client.sglang.requests("score")], [1, 1, 1])

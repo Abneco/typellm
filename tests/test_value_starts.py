@@ -100,7 +100,7 @@ class ValueStartTests(unittest.TestCase):
     def test_a_tokenizer_without_an_empty_string_token_still_works(self):
         del fake_vocab.PIECES[' ""']
         try:
-            client = TypeLLMClient(model="fake")
+            client = TypeLLMClient(model="fake", open_decoding="stepwise")
             client.sglang = FakeServer()
             self.assertEqual(client.sglang.json_value_starts()["string"], [(ord('"'), '"'), (328, ' "'), (951, '":')])
             result = client.generate(context="Receipt", questions={"note": {"type": ["string", "null"]}})
@@ -109,14 +109,14 @@ class ValueStartTests(unittest.TestCase):
             fake_vocab.PIECES[' ""'] = 901
 
     def test_negative_numbers_start_with_the_negative_token(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = SignServer(negative=True)
         result = client.generate(context="Log", questions={"t": {"type": "number"}})
         self.assertEqual(result, {"t": -7})
         self.assertIn('{"t": -7}', client.last_prompts[0])
 
     def test_a_positive_sign_rules_out_a_later_minus(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = SignServer(negative=False)
         self.assertEqual(client.generate(context="Log", questions={"t": {"type": "integer"}}), {"t": 7})
         digit_steps = [p["token_ids_logprob"] for p in client.sglang.requests("score")][1:]
@@ -124,7 +124,7 @@ class ValueStartTests(unittest.TestCase):
 
 
     def test_a_digit_right_after_the_colon_is_also_accepted(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = DirectDigitServer()
         result = client.generate(context="Log", questions={"t": {"type": ["integer", "null"]}})
         self.assertEqual(result, {"t": 7})
@@ -136,13 +136,13 @@ class ValueStartTests(unittest.TestCase):
 
     def test_null_is_weighed_against_every_value_start_together(self):
         # null (0.40) beats each start alone, but not the 0.60 they share.
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = SplitValueServer()
         self.assertEqual(client.generate(context="Log", questions={"t": {"type": ["integer", "null"]}}), {"t": 7})
 
 
     def test_a_spaceless_null_counts_and_is_written_with_the_space(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = SpacelessNullServer()
         result = client.generate(context="Log", questions={"t": {"type": ["number", "null"]}})
         self.assertEqual(result, {"t": None})
@@ -159,7 +159,7 @@ class ValueStartTests(unittest.TestCase):
                         [[0.0 if t == ord('"') else -9.0, t, "?"] for t in ids]]}}
                 return FakeServer._request(self, path, payload, allow_text=allow_text)
 
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = SpacelessQuoteServer()
         result = client.generate(context="Log", questions={"s": {"type": ["string", "null"]}})
         self.assertEqual(result, {"s": "blue"})
@@ -168,7 +168,7 @@ class ValueStartTests(unittest.TestCase):
         self.assertTrue(text["text"][0].endswith('{"s":'))
 
     def test_a_spaceless_null_also_counts_for_strings(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = SpacelessNullServer()
         self.assertEqual(client.generate(context="Log", questions={"s": {"type": ["string", "null"]}}), {"s": None})
 
@@ -176,7 +176,7 @@ class ValueStartTests(unittest.TestCase):
     def test_null_written_without_the_space_also_counts_as_null(self):
         # ' null' 0.30 + 'null' 0.25 = 0.55 is null, though ' null' alone loses to the rest.
         with patch.dict(fake_vocab.PIECES, {"null": 2827}):
-            client = TypeLLMClient(model="fake")
+            client = TypeLLMClient(model="fake", open_decoding="stepwise")
             client.sglang = KeyServer({819: 0.30, 2827: 0.25})
             self.assertEqual(client.sglang.json_value_starts()["null"], [(819, " null"), (2827, "null")])
             result = client.generate(context="Receipt", questions={"note": {"type": ["string", "null"]}})
@@ -184,7 +184,7 @@ class ValueStartTests(unittest.TestCase):
 
     def test_temperature_applies_to_null_after_the_value_starts_are_added_up(self):
         # Per-start temperature would make null (0.40) win almost always at 0.01.
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = SplitValueServer()
         result = client.generate(context="Log", questions={"t": {"type": ["integer", "null"]}},
                                  mode="sample", temperature=0.01)
@@ -196,7 +196,7 @@ class ValueStartTests(unittest.TestCase):
         with patch.dict(fake_vocab.PIECES, {**pieces, "null": 2827}, clear=True):
             for field in ({"type": ["string", "null"]}, {"type": ["number", "null"]}):
                 with self.subTest(field=field):
-                    client = TypeLLMClient(model="fake")
+                    client = TypeLLMClient(model="fake", open_decoding="stepwise")
                     client.sglang = FakeServer()
                     self.assertEqual(client.sglang.json_value_starts()["null"], [])
                     with self.assertRaisesRegex(ValueError, "a tokenizer that starts null"):
@@ -229,7 +229,7 @@ class StringStartTests(unittest.TestCase):
         self.assertEqual(build_string_start_table(Tokenizer()), [(1, '"'), (2, ' "Hello'), (5, '"}')])
 
     def test_null_competes_with_every_string_start(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient(model="fake", open_decoding="stepwise")
         client.sglang = KeyServer({819: 0.30, 2827: 0.25})
         client.generate(context="Receipt", questions={"note": {"type": ["string", "null"]}})
         [decision] = [p for p in client.sglang.requests("score") if 819 in p["token_ids_logprob"]]
