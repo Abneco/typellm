@@ -401,8 +401,10 @@ class TypeLLMClient:
     ) -> dict[str, Any]:
         """Answer every field; fields run in parallel unless they declare depends_on.
 
-        A seed makes this call reproducible on its own; without one, calls share
-        the client's random stream. timeout caps the whole call in seconds and
+        A seed fixes this call's own random choices and leaves the client's shared
+        stream alone; without one, calls share that stream. The server's numerics
+        can still vary with its cache and batching, so a seed does not guarantee
+        identical results. timeout caps the whole call in seconds and
         raises GenerationTimeout; setting cancel raises GenerationCancelled.
         Both stop the call before its next request to SGLang.
         """
