@@ -1,4 +1,4 @@
-"""128 numeric cases, stepwise vs grammar: answers, requests, latency; then 16-way throughput."""
+"""The 128 numeric eval cases: correct answers, requests, latency; then 16-way throughput."""
 import json
 import statistics
 import sys
@@ -14,9 +14,9 @@ from typellm import TypeLLMClient  # noqa: E402
 cases = [json.loads(l) for l in (ROOT / "evals/numeric_eval_cases.jsonl").read_text().splitlines()]
 
 
-def client(decoding):
+def client():
     return TypeLLMClient("http://127.0.0.1:30000", model="qwen3.8-27b",
-                         tokenizer="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead", open_decoding=decoding)
+                         tokenizer="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead")
 
 
 def one(c, case):
@@ -26,8 +26,8 @@ def one(c, case):
 
 
 report = {}
-for decoding in ("stepwise", "grammar"):
-    c = client(decoding)
+for decoding in ("grammar",):
+    c = client()
     one(c, cases[0])  # warm tokenizer and tables
     rows = []
     for case in cases:
@@ -57,9 +57,4 @@ for decoding in ("stepwise", "grammar"):
     print(decoding, json.dumps(summary), flush=True)
     report[decoding] = {"summary": summary, "rows": rows}
 
-diffs = [(a["id"], a["result"], b["result"]) for a, b in zip(report["stepwise"]["rows"], report["grammar"]["rows"])
-         if a["result"] != b["result"]]
-print("answer_differences", len(diffs))
-for d in diffs[:10]:
-    print("  ", json.dumps(d, ensure_ascii=False))
 Path("quick_decoding.json").write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str))

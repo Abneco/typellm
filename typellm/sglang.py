@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from contextlib import contextmanager
@@ -14,7 +13,6 @@ from typing import Any, Iterator, Mapping, Sequence
 
 import httpx
 
-from .numeric import load_token_tables
 from .protocol import detect_protocol
 
 
@@ -141,7 +139,6 @@ class SGLangClient:
         model: str | None = None,
         timeout: float = 120.0,
         tokenizer: str | None = None,
-        numeric_cache_dir: str | os.PathLike[str] | None = None,
         *,
         thinking: bool = False,
         thinking_budget: int | None = None,
@@ -165,15 +162,10 @@ class SGLangClient:
         self.model = model
         self.timeout = timeout
         self.tokenizer = tokenizer
-        self.numeric_cache_dir = numeric_cache_dir
         self._label_tokens: dict[str, tuple[int, str]] = {}
-        self._json_value_starts: dict[str, list[tuple[int, str]]] | None = None
         self._model_info_cache: Mapping[str, Any] | None = None
-        self._numeric_tokens: list[tuple[int, str]] | None = None
-        self._string_start_tokens: list[tuple[int, str]] | None = None
         self._chat_tokenizer: Any | None = None
         self._image_placeholder_cache: str | None = None
-        self._end_of_message: tuple[int, str] | None = None
         # Serializes the expensive lazy loads when threads share one client.
         self._load_lock = threading.RLock()
         self._http_client: httpx.Client | None = None
@@ -209,11 +201,9 @@ class SGLangClient:
         self.close()
 
     def warmup(self) -> None:
-        """Load the model info, tokenizer and token tables before the first request."""
+        """Load the model info and chat tokenizer before the first request."""
         self._tokenizer_model()
-        self.end_of_message_token()
-        self.json_value_starts()
-        self.numeric_token_pieces()
+        self._get_chat_tokenizer()
 
     def _info(self, name: str) -> Any:
         # SGLang 0.5.6 renamed /get_<name> to /<name>; older servers and
@@ -237,7 +227,7 @@ class SGLangClient:
     def _http(self) -> httpx.Client:
         with self._load_lock:
             if self._http_client is None:
-                # Keep-alive connections: numeric fields decode one request per token.
+                # Keep-alive connections: one call makes many small requests.
                 self._http_client = httpx.Client(limits=httpx.Limits(
                     max_connections=None, max_keepalive_connections=64,
                 ))
@@ -399,28 +389,6 @@ class SGLangClient:
         raise SGLangError(
             "Could not discover the tokenizer used by SGLang; pass tokenizer=..."
         )
-
-    def _load_token_tables(self) -> None:
-        with self._load_lock:
-            if self._numeric_tokens is not None and self._string_start_tokens is not None:
-                return
-            tables = load_token_tables(self._tokenizer_source(), self.numeric_cache_dir)
-            if self._numeric_tokens is None:
-                self._numeric_tokens = tables["tokens"]
-            if self._string_start_tokens is None:
-                self._string_start_tokens = tables["string_starts"]
-
-    def numeric_token_pieces(self) -> list[tuple[int, str]]:
-        """Return the cached numeric-token table for the served model tokenizer."""
-        if self._numeric_tokens is None:
-            self._load_token_tables()
-        return self._numeric_tokens
-
-    def string_start_pieces(self) -> list[tuple[int, str]]:
-        """Every token that can start a string value after '{"k":', such as ' "', '"' or '"This'."""
-        if self._string_start_tokens is None:
-            self._load_token_tables()
-        return self._string_start_tokens
 
     def _get_chat_tokenizer(self) -> Any:
         with self._load_lock:
@@ -663,80 +631,6 @@ class SGLangClient:
         # Discard any unconstrained answer after the marker. The existing
         # runtime records only selected labels/numbers in subsequent history.
         return protocol.answer_prefix(prefix, reasoning)
-
-    def end_of_message_token(self) -> tuple[int, str]:
-        """Return the tokenizer's single native end-of-message token."""
-        if self._end_of_message is None:
-            self._end_of_message = self._find_end_of_message_token()
-        return self._end_of_message
-
-    def _find_end_of_message_token(self) -> tuple[int, str]:
-        tokenizer = self._get_chat_tokenizer()
-        turn_end = detect_protocol(tokenizer).turn_end
-        if turn_end is not None:
-            token_ids = tokenizer.encode(turn_end, add_special_tokens=False)
-            if len(token_ids) != 1 or tokenizer.decode(token_ids, skip_special_tokens=False) != turn_end:
-                raise SGLangError(f"Chat turn terminator {turn_end!r} must be one exact token")
-            return int(token_ids[0]), turn_end
-        token_id = getattr(tokenizer, "eos_token_id", None)
-        token_text = getattr(tokenizer, "eos_token", None)
-        if not isinstance(token_id, int) or not isinstance(token_text, str):
-            raise SGLangError(
-                "The served tokenizer must define one EOS/end-of-message token"
-            )
-        return token_id, token_text
-
-    def _tokenize(self, text: str) -> list[int]:
-        tokenized = self._request(
-            "/v1/tokenize",
-            {"model": self._tokenizer_model(), "prompt": text, "add_special_tokens": False},
-        )
-        ids = tokenized.get("tokens") if isinstance(tokenized, Mapping) else None
-        if not isinstance(ids, list):
-            raise SGLangError(f"/v1/tokenize returned no token list for {text!r}")
-        return [int(i) for i in ids]
-
-    def json_value_starts(self) -> dict[str, list[tuple[int, str]]]:
-        """Tokens that start a JSON value right after '{"k":', read from the tokenizer.
-
-        Returns {"null": [...], "positive": [...], "negative": [...], "string": [...]}
-        as (token_id, text) pairs. Most tokenizers attach the space to the value:
-        ' null', ' -', ' "'; a positive number starts with a lone ' '. The
-        spaceless 'null', '"' and '""' are listed too when they are single
-        tokens. Strings take every token that can start one, from the vocabulary.
-        Kinds this tokenizer does not split that way are left empty.
-        """
-        if self._json_value_starts is not None:
-            return self._json_value_starts
-        key = '{"k":'
-        key_ids = self._tokenize(key)
-        starts: dict[str, list[tuple[int, str]]] = {"null": [], "positive": [], "negative": [], "string": []}
-        for kind, sample, accept in (
-            ("null", '{"k": null}', lambda piece: piece.strip() == "null"),
-            ("positive", '{"k": 1}', lambda piece: piece != "" and piece.strip() == ""),
-            ("negative", '{"k": -1}', lambda piece: piece.strip() == "-"),
-        ):
-            ids = self._tokenize(sample)
-            if ids[:len(key_ids)] != key_ids or len(ids) <= len(key_ids):
-                continue
-            token = ids[len(key_ids)]
-            piece = self._request("/v1/detokenize", {"model": self._tokenizer_model(), "tokens": [token]})
-            piece = piece.get("text") if isinstance(piece, Mapping) else None
-            if isinstance(piece, str) and accept(piece) and (token, piece) not in starts[kind]:
-                starts[kind].append((token, piece))
-        # A spaceless {"k":null} often merges with the colon ('":null'), so add
-        # 'null' directly when it is a single token. Only next to ' null': without
-        # it, {"k": null} starts with the space numbers share and null is hidden.
-        if starts["null"]:
-            try:
-                token = self.single_token("null")
-            except ValueError:
-                token = None
-            if token is not None and token not in starts["null"]:
-                starts["null"].append(token)
-        starts["string"] = list(self.string_start_pieces())
-        self._json_value_starts = starts
-        return starts
 
     def single_token(self, label: str) -> tuple[int, str]:
         """Return (token_id, exact decoded text), rejecting multi-token labels."""

@@ -5,24 +5,6 @@ from typellm import TypeLLMClient
 from tests.test_batching import FakeServer
 
 
-class CloseBraceServer(FakeServer):
-    """Numbers decode to 7 and end at "}" rather than the end-of-message token."""
-
-    def _request(self, path, payload=None, *, allow_text=False):
-        if path == "/generate" and "token_ids_logprob" in payload:
-            self.payloads.append(payload)
-            rows = payload["token_ids_logprob"]
-            rows = [rows] if isinstance(rows[0], int) else rows
-            out = []
-            for ids in rows:
-                pick = (ord("}") if ord("}") in ids else ord(" ") if ord(" ") in ids
-                        else ord("7") if ord("7") in ids else ids[0])
-                out.append({"meta_info": {"output_token_ids_logprobs": [
-                    [[0.0 if t == pick else -9.0, t, chr(t)] for t in ids]]}})
-            return out[0] if isinstance(payload["text"], str) else out
-        return super()._request(path, payload, allow_text=allow_text)
-
-
 class PrefillTests(unittest.TestCase):
     QUESTIONS = {
         "total": {"type": "number"},
@@ -30,23 +12,21 @@ class PrefillTests(unittest.TestCase):
         "paid": {"type": "boolean"},
     }
 
-    def run_generate(self, questions, open_decoding="grammar", **kwargs):
-        client = TypeLLMClient(model="fake", open_decoding=open_decoding)
+    def run_generate(self, questions, **kwargs):
+        client = TypeLLMClient(model="fake")
         client.sglang = FakeServer()
         result = client.generate(context="Receipt", questions=questions, **kwargs)
         return client, result
 
     def test_open_fields_continue_from_a_prefilled_key(self):
-        client, result = self.run_generate(self.QUESTIONS, open_decoding="stepwise")
+        client, result = self.run_generate(self.QUESTIONS)
         self.assertEqual(result, {"total": 7, "item": "blue", "paid": True})
-        [text] = [p for p in client.sglang.payloads if not isinstance(p["sampling_params"], dict)
-                  and "regex" in p["sampling_params"][0]]
-        # Strings continue from '{"item":'; the model writes the quote, the characters and '"}'.
-        self.assertTrue(text["text"][0].endswith('{"item":'))
-        numbers = [p for p in client.sglang.requests("score") if isinstance(p["text"], str)]
-        # The sign is chosen at the key, as the tokenizer splits {"total": 7}; digits follow the space.
-        self.assertTrue(numbers[0]["text"].endswith('{"total":'))
-        self.assertTrue(numbers[1]["text"].endswith('{"total": '))
+        grammar = [p for p in client.sglang.payloads if not isinstance(p["sampling_params"], dict)
+                   and "regex" in p["sampling_params"][0]]
+        # Numbers and strings continue from '{"name":'; the model writes the space, digits or quote.
+        prompts = [t for p in grammar for t in p["text"]]
+        self.assertTrue(any(t.endswith('{"total":') for t in prompts))
+        self.assertTrue(any(t.endswith('{"item":') for t in prompts))
         # Choices are scored at {"paid": " — the next token is the label.
         labels = [t for p in client.sglang.requests("score") for t in
                   ([p["text"]] if isinstance(p["text"], str) else p["text"]) if t.endswith('{"paid": "')]
@@ -56,17 +36,6 @@ class PrefillTests(unittest.TestCase):
         client, _ = self.run_generate(self.QUESTIONS)
         self.assertIn('{"total": 7}', client.last_prompts[0])
         self.assertIn('{"item": "blue"}', client.last_prompts[1])
-
-    def test_numbers_can_end_at_the_closing_brace(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
-        client.sglang = CloseBraceServer()
-        result = client.generate(context="Receipt", questions={"total": {"type": "integer"}})
-        self.assertEqual(result, {"total": 7})
-        # Sign, "7", then "}" ends the number: the brace is offered and chosen.
-        steps = client.sglang.requests("score")
-        self.assertEqual(len(steps), 3)
-        self.assertIn(ord("}"), steps[-1]["token_ids_logprob"])
-        self.assertTrue(steps[-1]["text"].endswith('{"total": 7'))
 
     def test_dag_children_extend_the_closed_parent(self):
         client, _ = self.run_generate({

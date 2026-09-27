@@ -57,17 +57,6 @@ class ProtocolTests(unittest.TestCase):
             self.assertIs(client._get_chat_tokenizer(), tokenizer)
         auto.from_pretrained.assert_called_once_with('/tokenizer', trust_remote_code=False)
 
-    def test_template_turn_end_takes_precedence_over_eos(self):
-        for family, expected in [('minicpm5', '<|im_end|>'), ('ling', '<|role_end|>'), ('ring', '</s>')]:
-            client = self.client(family)
-            self.assertEqual(client.end_of_message_token()[1], expected)
-
-    def test_multi_token_terminator_is_rejected(self):
-        client = self.client('minicpm5')
-        client._chat_tokenizer.encode = lambda *args, **kwargs: [1, 2]
-        with self.assertRaisesRegex(SGLangError, 'one exact token'):
-            client.end_of_message_token()
-
     def test_gemma_is_rejected_before_inference(self):
         for thinking in (False, True):
             client = self.client('gemma', thinking)

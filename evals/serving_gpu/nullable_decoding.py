@@ -1,4 +1,4 @@
-"""Nullable fields, stepwise vs grammar open-field decoding, on a live SGLang server.
+"""Nullable fields on a live SGLang server.
 
 Values that start with a merged token (' "$', ' "/', ' "(' ...), missing values,
 negative and zero numbers, with nullable booleans and enums as a control. Each
@@ -56,12 +56,8 @@ CASES = [
 ]
 
 
-def client(decoding):
-    return TypeLLMClient(URL, model=MODEL, tokenizer=TOKENIZER, open_decoding=decoding)
-
-
-def run(decoding):
-    c = client(decoding)
+def run():
+    c = TypeLLMClient(URL, model=MODEL, tokenizer=TOKENIZER)
     rows = []
     for context, fields in CASES:
         questions = {name: spec for name, (spec, _) in fields.items()}
@@ -76,15 +72,13 @@ def run(decoding):
     return rows
 
 
-report = {d: run(d) for d in ("stepwise", "grammar")}
+report = {"grammar": run()}
 for d, rows in report.items():
     print(d, "batch", sum(r["batch_ok"] for r in rows), "/", len(rows),
           "single", sum(r["single_ok"] for r in rows), "/", len(rows),
           "requests", sum(r.get("batch_requests", 0) for r in rows))
-print(f"{'field':15} {'expected':28} {'stepwise batch/single':34} {'grammar batch/single'}")
-for a, b in zip(report["stepwise"], report["grammar"]):
-    mark = "" if a["batch_ok"] and a["single_ok"] and b["batch_ok"] and b["single_ok"] else "  <--"
-    print(f"{a['field']:15} {json.dumps(a['expected']):28} "
-          f"{json.dumps(a['batch'])+' / '+json.dumps(a['single']):34} "
-          f"{json.dumps(b['batch'])+' / '+json.dumps(b['single'])}{mark}")
+print(f"{'field':15} {'expected':28} batch / single")
+for r in report["grammar"]:
+    mark = "" if r["batch_ok"] and r["single_ok"] else "  <--"
+    print(f"{r['field']:15} {json.dumps(r['expected']):28} {json.dumps(r['batch'])} / {json.dumps(r['single'])}{mark}")
 Path("nullable_decoding.json").write_text(json.dumps(report, indent=1, ensure_ascii=False))

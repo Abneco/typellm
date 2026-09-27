@@ -30,23 +30,8 @@ class ReplyServer(FakeServer):
         return super()._request(path, payload, allow_text=allow_text)
 
 
-class ValueServer(FakeServer):
-    """Picks the ' "' string start wherever it is offered, so strings are not null."""
-
-    def _request(self, path, payload=None, *, allow_text=False):
-        if path == "/generate" and "token_ids_logprob" in payload:
-            rows = payload["token_ids_logprob"]
-            if 328 in (rows if isinstance(rows[0], int) else sum(rows, [])):
-                self.payloads.append(payload)
-                rows = [rows] if isinstance(rows[0], int) else rows
-                out = [{"meta_info": {"output_token_ids_logprobs": [
-                    [[0.0 if t == 328 else -9.0, t, "?"] for t in ids]]}} for ids in rows]
-                return out[0] if isinstance(payload["text"], str) else out
-        return super()._request(path, payload, allow_text=allow_text)
-
-
 class PatternTests(unittest.TestCase):
-    """The regex admits exactly the numbers the stepwise decoder completes."""
+    """The regex admits exactly the numbers the parser accepts."""
 
     def samples(self, max_digits):
         short = ("".join(chars) for n in range(1, 6) for chars in itertools.product("-0.19", repeat=n))
@@ -55,7 +40,7 @@ class PatternTests(unittest.TestCase):
                 "-" + "9" * max_digits]
         return itertools.chain(short, long)
 
-    def test_the_pattern_matches_the_stepwise_rules(self):
+    def test_the_pattern_matches_the_parser(self):
         for numeric_type in ("number", "integer"):
             for max_digits in (32, 4):
                 pattern = re.compile(numeric_pattern(numeric_type, max_digits))
@@ -87,13 +72,6 @@ class GrammarNumberTests(unittest.TestCase):
         self.assertEqual(numbers["sampling_params"][0]["temperature"], 0)
         self.assertIn('{"a": 7}', client.last_prompts[0])
 
-    def test_stepwise_still_scores_every_token(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
-        client.sglang = FakeServer()
-        client.generate(context="Receipt", questions=self.QUESTIONS)
-        self.assertEqual(regex_requests(client.sglang), [])
-        self.assertEqual(len(client.sglang.requests("score")), 3)
-
     def test_sampling_passes_the_temperature_and_no_truncation(self):
         client = TypeLLMClient(model="fake", mode="sample", temperature=0.7, seed=1)
         client.sglang = FakeServer()
@@ -124,33 +102,6 @@ class GrammarNumberTests(unittest.TestCase):
                 client.sglang = ReplyServer(reply)
                 self.assertEqual(client.generate(context="R", questions={"a": {"type": "number"}}),
                                  {"a": value})
-
-    def test_unknown_decodings_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "open_decoding"):
-            TypeLLMClient(model="fake", open_decoding="fast")
-
-
-class GrammarNullableTextTests(unittest.TestCase):
-    def test_a_nullable_string_writes_null_or_text_in_one_request(self):
-        client = TypeLLMClient(model="fake")
-        client.sglang = NullServer()
-        result = client.generate(context="Receipt", questions={
-            "note": {"type": ["string", "null"]}, "name": {"type": "string"}})
-        self.assertEqual(result, {"note": None, "name": "blue"})
-        self.assertEqual(client.sglang.requests("score"), [])  # no separate null step
-        [texts] = regex_requests(client.sglang)
-        patterns = [p["regex"] for p in texts["sampling_params"]]
-        self.assertIn("null", patterns[0])
-        self.assertNotIn("null", patterns[1])
-
-    def test_stepwise_text_after_the_null_step_cannot_be_null(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
-        client.sglang = ValueServer()
-        result = client.generate(context="Receipt", questions={"note": {"type": ["string", "null"]}})
-        self.assertEqual(result, {"note": "blue"})
-        self.assertEqual(len(client.sglang.requests("score")), 1)  # the null step
-        [texts] = regex_requests(client.sglang)
-        self.assertNotIn("null", texts["sampling_params"][0]["regex"])
 
 
 if __name__ == "__main__":

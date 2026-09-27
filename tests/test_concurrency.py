@@ -224,22 +224,6 @@ class DeadlineTests(unittest.TestCase):
 
 
 class LazyLoadTests(unittest.TestCase):
-    def test_token_tables_load_once_across_threads(self):
-        calls = []
-
-        def load(source, cache_dir):
-            calls.append(source)
-            time.sleep(0.01)
-            return {"tokens": [(1, "1")], "string_starts": [(2, '"')]}
-
-        client = SGLangClient(model="fake", tokenizer="fake-tokenizer")
-        with patch("typellm.sglang.load_token_tables", side_effect=load):
-            with ThreadPoolExecutor(8) as pool:
-                tables = list(pool.map(lambda _: client.numeric_token_pieces(), range(8)))
-        self.assertEqual(calls, ["fake-tokenizer"])
-        self.assertTrue(all(table == [(1, "1")] for table in tables))
-        self.assertEqual(client.string_start_pieces(), [(2, '"')])
-
     def test_the_chat_tokenizer_loads_once_across_threads(self):
         calls = []
         barrier = threading.Barrier(4)

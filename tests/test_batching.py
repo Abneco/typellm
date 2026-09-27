@@ -4,7 +4,7 @@ import unittest
 from typellm import SGLangClient, TypeLLMClient
 from typellm.images import encode_image
 
-from tests.test_images import PNG, VisionTokenizer, fake_detokenize, fake_string_starts, fake_tokenize
+from tests.test_images import PNG, VisionTokenizer, fake_detokenize, fake_tokenize
 
 THINK_STOP = "</think>"
 
@@ -29,8 +29,6 @@ class FakeServer(SGLangClient):
     def __init__(self, thinking=False):
         super().__init__(model="fake", thinking=thinking)
         self._chat_tokenizer = ThinkingTokenizer()
-        self._numeric_tokens = [(ord(c), c) for c in "-0123456789."]
-        self._string_start_tokens = fake_string_starts()
         self._context_length_cache = 100_000
         self.payloads = []
 
@@ -83,24 +81,6 @@ class FakeServer(SGLangClient):
 
 def width(payload):
     return 1 if isinstance(payload["text"], str) else len(payload["text"])
-
-
-class NumericLockstepTests(unittest.TestCase):
-    def test_numbers_share_one_request_per_digit_step(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
-        client.sglang = FakeServer()
-        result = client.generate(context="Receipt", questions={
-            "a": {"type": "integer"}, "b": {"type": "number"}, "c": {"type": "integer"},
-        })
-        self.assertEqual(result, {"a": 7, "b": 7, "c": 7})
-        # Sign, "7", then the end token: three steps, each scoring all three fields.
-        self.assertEqual([width(p) for p in client.sglang.requests("score")], [3, 3, 3])
-
-    def test_a_single_number_keeps_single_requests(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
-        client.sglang = FakeServer()
-        client.generate(context="Receipt", questions={"a": {"type": "integer"}})
-        self.assertEqual([width(p) for p in client.sglang.requests("score")], [1, 1, 1])
 
 
 class BatchedThinkingTests(unittest.TestCase):

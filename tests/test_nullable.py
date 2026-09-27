@@ -2,36 +2,20 @@ import unittest
 
 from typellm import SchemaError, TypeLLMClient, compile_json_schema
 
-from tests.test_batching import FakeServer, width
+from tests.test_batching import FakeServer, is_number_pattern, width
 from tests.test_typellm import FakeSGLang
-
-NULL_ID = 819  # " null", as tokenized after {"name":
-
 
 def compile_field(field):
     return compile_json_schema({"type": "object", "properties": {"x": field}})[0]
 
 
 class NullServer(FakeServer):
-    """FakeServer whose model prefers null wherever null is offered."""
+    """FakeServer whose model writes null wherever the grammar allows it."""
 
     def _request(self, path, payload=None, *, allow_text=False):
-        if path == "/generate" and "token_ids_logprob" in payload:
-            rows = payload["token_ids_logprob"]
-            flat = rows if isinstance(rows[0], int) else sum(rows, [])
-            if NULL_ID in flat:
-                self.payloads.append(payload)
-                rows = [rows] if isinstance(rows[0], int) else rows
-                out = []
-                for ids in rows:
-                    pick = (NULL_ID if NULL_ID in ids else ord(" ") if ord(" ") in ids
-                            else 1 if 1 in ids else ord("7") if ord("7") in ids else ids[0])
-                    out.append({"meta_info": {"output_token_ids_logprobs": [
-                        [[0.0 if t == pick else -9.0, t, "?"] for t in ids]]}})
-                return out[0] if isinstance(payload["text"], str) else out
         if path == "/generate" and any("regex" in p for p in _params(payload)):
             self.payloads.append(payload)
-            out = [{"text": " null}" if "null" in p["regex"] else ' "blue"}',
+            out = [{"text": " null}" if "null" in p["regex"] else " 7}" if is_number_pattern(p["regex"]) else ' "blue"}',
                     "meta_info": {"finish_reason": {"type": "stop"}}} for p in _params(payload)]
             return out[0] if isinstance(payload["text"], str) else out
         return super()._request(path, payload, allow_text=allow_text)
@@ -63,7 +47,7 @@ class CompileTests(unittest.TestCase):
 
 class RuntimeTests(unittest.TestCase):
     def test_nullable_number_can_answer_null(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
+        client = TypeLLMClient(model="fake")
         client.sglang = NullServer()
         result = client.generate(context="Receipt", questions={
             "tip": {"type": ["number", "null"]}, "count": {"type": "integer"},
@@ -71,21 +55,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result, {"tip": None, "count": 7})
         self.assertIn("Return null only if there is no value.", client.last_prompts[0])
 
-    def test_nullable_string_decides_null_before_writing(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
+    def test_nullable_string_writes_null_in_its_text_request(self):
+        client = TypeLLMClient(model="fake")
         client.sglang = NullServer()
         result = client.generate(context="Receipt", questions={
             "note": {"type": ["string", "null"], "maxLength": 20}, "name": {"type": "string"},
         })
         self.assertEqual(result, {"note": None, "name": "blue"})
-        # Only the non-null string is generated, continuing from '{"name": "'.
+        self.assertEqual(client.sglang.requests("score"), [])  # no separate null step
+        # One request for both strings, from '{"note":' and '{"name":'; only the nullable one may be null.
         [text] = [p for p in client.sglang.payloads
                   if not isinstance(p["sampling_params"], dict) and "regex" in p["sampling_params"][0]]
-        self.assertEqual(width(text), 1)
-        self.assertTrue(text["text"][0].endswith('{"name":'))
+        self.assertEqual(width(text), 2)
+        self.assertTrue(text["text"][0].endswith('{"note":'))
+        self.assertTrue(text["text"][1].endswith('{"name":'))
+        self.assertIn("null", text["sampling_params"][0]["regex"])
+        self.assertNotIn("null", text["sampling_params"][1]["regex"])
+        self.assertIn('{"note": null}', client.last_prompts[0])
 
     def test_nullable_boolean_scores_null_as_a_choice(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
+        client = TypeLLMClient(model="fake")
         client.sglang = FakeSGLang(selected_ids=[ord("C")])
         result = client.generate(context="Receipt", questions={
             "paid": {"type": ["boolean", "null"], "return_probabilities": True},
@@ -94,7 +83,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(set(result["paid"]["probabilities"]), {True, False, None})
 
     def test_dependents_see_null(self):
-        client = TypeLLMClient(model="fake", open_decoding="stepwise")
+        client = TypeLLMClient(model="fake")
         client.sglang = NullServer()
         client.generate(context="Receipt", questions={
             "tip": {"type": ["number", "null"]},

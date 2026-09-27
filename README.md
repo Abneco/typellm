@@ -14,6 +14,8 @@
 </div>
 
 ## Updates
+
+- **[2026/09/27]** Added per-call `seed`, `timeout` and `cancel`, `last_usage`, and sharing one client across threads. See [Serving](#serving).
 - **[2026/09/24]** Added [image input](#image-input) for vision-language models, tested with Qwen3.8-27B.
 - **[2026/09/23]** Added [JevBench results](https://github.com/TypeLLM/TypeLLM/blob/main/evals/jevbench/README.md): TypeLLM scored 195/231 without thinking and 228/231 with thinking.
 - **[2026/09/23]** Added [permutation averaging](#per-question-permutation-averaging) to improve the predictive distribution. See the [blog post](https://typellm.ai/blog/fair-die).
@@ -407,14 +409,6 @@ print(client.last_usage)
 `last_usage` reports the SGLang requests and tokens of the last call made in the
 current thread, including a call that failed partway. A timeout or cancel stops
 the call before its next SGLang request.
-
-Numbers, and nullable strings, are decoded by SGLang in one constrained request
-per field (`open_decoding="grammar"`, the default). `open_decoding="stepwise"`
-scores every token in TypeLLM instead, one request per token:
-
-```python
-client = TypeLLMClient("http://127.0.0.1:30000", open_decoding="stepwise")
-```
 
 ## Cost analysis
 

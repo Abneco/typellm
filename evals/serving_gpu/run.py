@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
-parser.add_argument("phase", choices=["parity", "perf", "features", "load", "decoding"])
+parser.add_argument("phase", choices=["parity", "perf", "features", "load"])
 parser.add_argument("--root", required=True, help="TypeLLM checkout to import")
 parser.add_argument("--output", required=True)
 parser.add_argument("--url", default="http://127.0.0.1:30000")
@@ -303,82 +303,7 @@ def load():
     return {"rows": rows}
 
 
-def decoding():
-    """Grammar vs stepwise open-field decoding: same answers, fewer requests?
-
-    Runs stepwise, grammar, stepwise again: the two stepwise runs show how much
-    the server's own numerics move answers, the baseline for the grammar diff.
-    """
-    sys.path.insert(0, str(Path(args.root) / "evals"))
-    from numeric_eval import matches, schema_for
-
-    cases = [json.loads(line) for line in (Path(args.root) / "evals/numeric_eval_cases.jsonl").read_text().splitlines()]
-    out = {}
-
-    def run_suite(name, **options):
-        c = client(**options)
-        rows = []
-        for case in cases:
-            start = time.perf_counter()
-            try:
-                result = c.generate(context=case["context"], schema=schema_for(case))
-                error = None
-            except Exception as exc:
-                result, error = None, f"{type(exc).__name__}: {exc}"[:200]
-            elapsed = time.perf_counter() - start
-            answer = result.get("answer") if result else None
-            rows.append({"id": case["id"], "answer": answer, "result": result, "error": error,
-                         "correct": error is None and matches(answer, case["expected"]),
-                         "elapsed": elapsed, "requests": c.last_usage.requests if c.last_usage else None})
-        summary = {"correct": sum(r["correct"] for r in rows), "errors": sum(bool(r["error"]) for r in rows),
-                   "median_s": statistics.median(r["elapsed"] for r in rows),
-                   "total_s": sum(r["elapsed"] for r in rows),
-                   "requests": sum(r["requests"] or 0 for r in rows)}
-        print(name, json.dumps(summary), flush=True)
-        out[name] = {"summary": summary, "rows": rows}
-        return rows
-
-    def diff(a, b):
-        return [{"id": x["id"], "a": x["result"], "b": y["result"]}
-                for x, y in zip(out[a]["rows"], out[b]["rows"]) if x["result"] != y["result"]]
-
-    run_suite("stepwise_1", open_decoding="stepwise")
-    run_suite("grammar", open_decoding="grammar")
-    run_suite("stepwise_2", open_decoding="stepwise")
-    out["diff_stepwise_vs_stepwise"] = diff("stepwise_1", "stepwise_2")
-    out["diff_grammar_vs_stepwise"] = diff("stepwise_1", "grammar")
-    print("diffs", len(out["diff_stepwise_vs_stepwise"]), len(out["diff_grammar_vs_stepwise"]), flush=True)
-    for name, options in (("thinking_stepwise", {"open_decoding": "stepwise"}),
-                          ("thinking_grammar", {"open_decoding": "grammar"})):
-        run_suite(name, thinking=True, thinking_budget=512, **options)
-
-    # The mixed fixed cases, and latency under concurrency, for each decoding.
-    for decoding_name in ("stepwise", "grammar"):
-        rows = []
-        for name, options, request in CASES:
-            result, error, elapsed, c = call({**options, "open_decoding": decoding_name}, request)
-            rows.append({"case": name, "result": result, "error": error, "elapsed": round(elapsed, 3),
-                         "requests": c.last_usage.requests if c.last_usage else None})
-        out[f"cases_{decoding_name}"] = rows
-        shared = client(open_decoding=decoding_name)
-        for threads in (1, 16):
-            def one(n):
-                start = time.perf_counter()
-                shared.generate(context=SHEET.replace("1234.5", str(1000 + n)), questions=NUMERIC_Q)
-                return time.perf_counter() - start
-            start = time.perf_counter()
-            with ThreadPoolExecutor(threads) as pool:
-                latencies = sorted(pool.map(one, range(max(16, threads * 4))))
-            wall = time.perf_counter() - start
-            out[f"numeric_load_{decoding_name}_{threads}"] = {
-                "calls_per_s": len(latencies) / wall, "p50": latencies[len(latencies) // 2],
-                "p95": latencies[max(0, int(len(latencies) * 0.95) - 1)]}
-            print(decoding_name, threads, json.dumps(out[f"numeric_load_{decoding_name}_{threads}"]), flush=True)
-    return out
-
-
 report = {"phase": args.phase, "root": args.root, "typellm": typellm.__file__}
-report.update({"parity": parity, "perf": perf, "features": features, "load": load,
-               "decoding": decoding}[args.phase]())
+report.update({"parity": parity, "perf": perf, "features": features, "load": load}[args.phase]())
 Path(args.output).write_text(json.dumps(report, indent=2, ensure_ascii=False, default=vars))
 print(json.dumps(report, ensure_ascii=False, default=vars)[:4000])

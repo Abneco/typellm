@@ -2,6 +2,7 @@ import unittest
 
 import httpx
 
+from typellm.runtime import numeric_pattern
 from typellm import (
     SGLangClient,
     SGLangError,
@@ -9,7 +10,6 @@ from typellm import (
     TypeLLMClient,
     compile_json_schema,
 )
-from typellm.numeric import build_numeric_token_table
 
 
 def mock_http(handler):
@@ -35,15 +35,15 @@ class BrokenStream(httpx.SyncByteStream):
 
 
 class FakeSGLang:
-    def __init__(self, selected_ids=None, numeric_pieces=None):
+    def __init__(self, selected_ids=None, numbers=None):
         self.selected_ids = iter(selected_ids or [32])
+        self.numbers = iter(numbers or [])  # replies to number requests; " 7}" when exhausted
         self.prompts = []
         self.cached_prefixes = []
         self.batch_prompts = []
         self.candidate_sets = []
-        self.numeric_pieces = numeric_pieces or [
-            (ord(piece), piece) for piece in '-0123456789."'
-        ]
+        self.number_prefixes = []
+        self.number_patterns = []
 
     def render_chat(self, messages, *, add_generation_prompt):
         rendered = "".join(
@@ -52,14 +52,13 @@ class FakeSGLang:
         )
         return rendered + ("<assistant>" if add_generation_prompt else "")
 
-    def end_of_message_token(self):
-        return 3, "<eom>"
-
     def single_token(self, label):
         return ord(label), label
 
-    def numeric_token_pieces(self):
-        return self.numeric_pieces
+    def generate_numbers(self, prefixes, patterns, max_new_tokens, *, temperature=0, seed=0):
+        self.number_prefixes.extend(prefixes)
+        self.number_patterns.extend(patterns)
+        return [next(self.numbers, " 7}") for _ in prefixes]
 
     def score_candidates(self, prefix, candidate_ids):
         self.prompts.append(prefix)
@@ -187,65 +186,6 @@ class JsonSchemaCompilerTests(unittest.TestCase):
         )
         self.assertEqual(decisions[0].question, "Pick a priority.")
         self.assertEqual(decisions[1].question, 'Choose the value for "size".')
-
-    def test_table_comes_from_exact_decoded_model_tokens(self):
-        class FakeTokenizer:
-            def get_vocab(self, with_added_tokens=True):
-                return {
-                    "five": 5,
-                    "fifty_four": 54,
-                    "finished": 55,
-                    "bad_suffix": 56,
-                    "bad_quote": 57,
-                    "repeated_minus": 58,
-                    "repeated_dot": 59,
-                }
-
-            def decode(self, ids, skip_special_tokens=False):
-                return {
-                    5: "5",
-                    54: "54",
-                    55: '54"',
-                    56: "12kg",
-                    57: '"42',
-                    58: "--",
-                    59: '.."',
-                }[ids[0]]
-
-        self.assertEqual(
-            build_numeric_token_table(FakeTokenizer()),
-            [(5, "5"), (54, "54"), (55, '54"')],
-        )
-
-    def test_numeric_table_cache_round_trip_and_recovery(self):
-        import tempfile
-        from pathlib import Path
-        from unittest.mock import patch
-        import typellm.numeric
-
-        class FakeTokenizer:
-            def to_str(self):
-                return "serialized-tokenizer"
-
-            def get_vocab(self, with_added_tokens=True):
-                return {"five": 5, "unit": 6}
-
-            def decode(self, ids, skip_special_tokens=False):
-                return {5: "5", 6: "kg"}[ids[0]]
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            typellm.numeric, "_load_tokenizer", return_value=FakeTokenizer()
-        ):
-            load = typellm.numeric.load_numeric_token_table
-            self.assertEqual(load("source", directory), [(5, "5")])
-            [cache_file] = Path(directory).iterdir()
-            with patch.object(typellm.numeric, "build_numeric_token_table") as rebuild:
-                self.assertEqual(load("source", directory), [(5, "5")])
-                rebuild.assert_not_called()
-            cache_file.write_text("{truncated", encoding="utf-8")
-            self.assertEqual(load("source", directory), [(5, "5")])
-            self.assertIn('"tokens":[[5,"5"]]', cache_file.read_text(encoding="utf-8"))
-            self.assertEqual(typellm.numeric.load_token_tables("source", directory)["string_starts"], [])
 
     def test_boolean(self):
         [decision] = compile_json_schema(
@@ -449,7 +389,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
 
     def test_questions_numeric_and_reserved_field_names(self):
         client = TypeLLMClient()
-        client.sglang = FakeSGLang([ord("7"), 3, ord("A")])
+        client.sglang = FakeSGLang([ord("A")])
         result = client.generate(context="Seven", questions={
             "type": {"type": "integer", "instructions": "Extract the number."},
             "properties": {"type": "boolean", "instructions": "Is it seven?"},
@@ -559,7 +499,7 @@ class ThinkingTests(unittest.TestCase):
         stops = [{"type": "length"}, {"type": "stop", "matched": "<|im_end|>"}]
         for finish in stops:
             thinking = self.make_client({"text": "Partial", "meta_info": {"finish_reason": finish}})
-            fake = FakeSGLang([ord("7"), 3, ord("A")])
+            fake = FakeSGLang([ord("A")])
             render = fake.render_chat
             def render_with_thinking(messages, *, add_generation_prompt):
                 prompt = render(messages, add_generation_prompt=add_generation_prompt)
@@ -574,6 +514,7 @@ class ThinkingTests(unittest.TestCase):
             self.assertEqual(client.generate(context="test", questions={
                 "n": {"type": "integer"}, "b": {"type": "boolean"}, "t": {"type": "string"},
             }), {"n": 7, "b": True, "t": "blue"})
+            self.assertTrue(all(p.endswith('</think>\n\n{"n":') for p in fake.number_prefixes))
 
     def test_incomplete_or_empty_thinking_returns_no_answer(self):
         from typellm import SGLangError
@@ -616,7 +557,7 @@ class ThinkingTests(unittest.TestCase):
 
 
 class JsonSchemaExecutionTests(unittest.TestCase):
-    def test_chat_template_disables_thinking_and_uses_native_eom(self):
+    def test_chat_template_disables_thinking(self):
         client = SGLangClient()
         tokenizer = FakeChatTokenizer()
         client._chat_tokenizer = tokenizer
@@ -629,9 +570,6 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         self.assertEqual(rendered, "rendered-chat")
         self.assertEqual(tokenizer.calls[0][1]["enable_thinking"], False)
         self.assertTrue(tokenizer.calls[0][1]["add_generation_prompt"])
-        self.assertEqual(
-            client.end_of_message_token(), (248046, "<|im_end|>")
-        )
 
     def test_template_bos_is_dropped_only_when_the_tokenizer_adds_its_own(self):
         client = SGLangClient()
@@ -715,7 +653,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         # The dependent field continues from the parent's closed answer.
         self.assertIn('<assistant>{"scale": "B"}</assistant>', fake.batch_prompts[1][0])
 
-    def test_open_integer_is_constrained_per_character(self):
+    def test_open_integer_is_generated_under_its_pattern(self):
         schema = {
             "type": "object",
             "properties": {
@@ -729,49 +667,19 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             },
         }
         client = TypeLLMClient()
-        fake = FakeSGLang([ord("4"), ord("2"), 3, ord("A")])
-        client.sglang = fake
-
-        result = client.generate(
-            context="context", schema=schema
-        )
-
-        self.assertEqual(result["count"], 42)
-        self.assertEqual(result["enabled"], True)
-        self.assertNotIn(3, fake.candidate_sets[0])
-        self.assertIn(3, fake.candidate_sets[1])
-        self.assertIn(
-            'Type: integer, minimum 0, maximum 100\nInstructions: How many items?\nAnswer as {"count": <integer>}.',
-            fake.prompts[0],
-        )
-        self.assertIn('<assistant>{"count": 42}</assistant>', client.last_prompts[0])
-
-    def test_open_integer_can_finish_with_one_multi_character_model_token(self):
-        schema = {
-            "type": "object",
-            "properties": {
-                "answer": {
-                    "type": "integer",
-                    "instructions": "What is 127 multiplied by 43?",
-                }
-            },
-        }
-        client = TypeLLMClient()
-        fake = FakeSGLang(
-            [9001, 3],
-            numeric_pieces=[
-                (9001, "5461"),
-                (9002, "127"),
-                (9003, "12kg"),
-            ],
-        )
+        fake = FakeSGLang([ord("A")], numbers=[" 42}"])
         client.sglang = fake
 
         result = client.generate(context="context", schema=schema)
 
-        self.assertEqual(result, {"answer": 5461})
-        self.assertEqual(fake.candidate_sets, [[9001, 9002], [9001, 9002, 3, ord("}")]])
-        self.assertIn('<assistant>{"answer": 5461}</assistant>', client.last_prompts[0])
+        self.assertEqual(result, {"count": 42, "enabled": True})
+        self.assertEqual(fake.number_patterns, [numeric_pattern("integer", 32)])
+        self.assertIn(
+            'Type: integer, minimum 0, maximum 100\nInstructions: How many items?\nAnswer as {"count": <integer>}.',
+            fake.number_prefixes[0],
+        )
+        self.assertTrue(fake.number_prefixes[0].endswith('<assistant>{"count":'))
+        self.assertIn('<assistant>{"count": 42}</assistant>', client.last_prompts[0])
 
     def test_open_float_supports_sign_decimal_and_message_termination(self):
         schema = {
@@ -779,9 +687,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             "properties": {"temperature": {"type": "number"}},
         }
         client = TypeLLMClient()
-        fake = FakeSGLang(
-            [ord("-"), ord("0"), ord("."), ord("7"), ord("5"), 3]
-        )
+        fake = FakeSGLang(numbers=[" -0.75"])  # ends at the end of the message
         client.sglang = fake
 
         result = client.generate(context="context", schema=schema)
@@ -803,9 +709,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             ):
                 with self.subTest(value=value, bounds=bounds):
                     client = TypeLLMClient(numeric_max_digits=401)
-                    client.sglang = FakeSGLang(
-                        [9001, 3], numeric_pieces=[(9001, str(value))]
-                    )
+                    client.sglang = FakeSGLang(numbers=[f" {value}}}"])
                     questions = {"n": {"type": "integer", **bounds}}
                     if error is not None:
                         with self.assertRaisesRegex(ValueError, error):
@@ -819,22 +723,9 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         for sign in ("", "-"):
             with self.subTest(sign=sign):
                 client = TypeLLMClient(numeric_max_digits=401)
-                client.sglang = FakeSGLang(
-                    [9001, 3], numeric_pieces=[(9001, sign + str(10**400))]
-                )
+                client.sglang = FakeSGLang(numbers=[f" {sign}{10**400}}}"])
                 with self.assertRaisesRegex(ValueError, "non-finite number"):
                     client.generate(context="context", questions={"n": {"type": "number"}})
-
-    def test_open_number_never_enters_a_dead_end_at_the_digit_limit(self):
-        client = TypeLLMClient(numeric_max_digits=2)
-        fake = FakeSGLang([ord("1"), ord("2"), 3])
-        client.sglang = fake
-
-        result = client.generate(context="context", questions={"n": {"type": "number"}})
-
-        self.assertEqual(result, {"n": 12.0})
-        self.assertIn(ord("."), fake.candidate_sets[1])
-        self.assertEqual(fake.candidate_sets[2], [3, ord("}")])
 
     def test_text_prompt_keeps_non_ascii_field_names_readable(self):
         [compiled] = TypeLLMClient().compile_schema(
@@ -958,7 +849,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             },
         }
         client = TypeLLMClient()
-        fake = FakeSGLang([ord("7"), 3, ord("A")])
+        fake = FakeSGLang([ord("A")])
         client.sglang = fake
 
         result = client.generate(context="context", schema=schema)

@@ -39,44 +39,6 @@ def _closed_label(decision: "Choice", label: str) -> str:
     return decision.label_prefill + label + '"}' if decision.label_prefill else label
 
 
-def _logsumexp(values: Sequence[float]) -> float:
-    pivot = max(values)
-    return pivot + math.log(math.fsum(math.exp(v - pivot) for v in values))
-
-
-def _choose(probs: Mapping[str, float], mode: str, rng: random.Random) -> str:
-    return max(probs, key=probs.__getitem__) if mode == "argmax" else _sample(probs, rng)
-
-
-def _decide_nulls(client, items, mode, temperature, rng) -> list[bool]:
-    """Decide null or string for nullable string fields in one batched request.
-
-    At the prefilled key, the tokens that start null compete with the tokens that
-    start a string, as this tokenizer splits {"name": null} and {"name": "text"}.
-    """
-    starts = client.json_value_starts()
-    if not starts["null"] or not starts["string"]:
-        raise ValueError("Nullable string fields need a tokenizer that starts null and strings "
-                         'with single tokens after \'{"name":\'')
-    null_ids = [token for token, _ in starts["null"]]
-    ids = null_ids + [token for token, _ in starts["string"]]
-    if len(items) == 1:
-        by_id, meta, _ = client.score_candidates(items[0][0], ids)
-        scored = [(by_id, meta)]
-    else:
-        scored, _ = client.score_candidates_batch([prompt for prompt, _ in items], [ids] * len(items))
-    nulls = []
-    for (_, decision), (by_id, _) in zip(items, scored):
-        probs = candidate_softmax(
-            {"null": _logsumexp([by_id[i] for i in null_ids]),
-             "value": _logsumexp([by_id[i] for i in ids if i not in null_ids])},
-            temperature if mode == "sample" else 1.0)
-        choice = _choose(probs, mode, rng)
-        LOG.info("null_decision name=%s p_null=%.4f selected=%s", decision.name, probs["null"], choice)
-        nulls.append(choice == "null")
-    return nulls
-
-
 def _user_content(text: str, image_count: int) -> str | list[dict[str, str]]:
     """Put images ahead of the text in the first user turn."""
     if not image_count:
@@ -192,19 +154,11 @@ class TypeLLMClient:
         label_pool: Sequence[str] | None = None,
         numeric_max_digits: int = 32,
         tokenizer: str | None = None,
-        numeric_cache_dir: str | os.PathLike[str] | None = None,
         thinking: bool = False,
         thinking_budget: int | None = None,
         text_max_tokens: int = 512,
-        open_decoding: str = "grammar",
     ) -> None:
         _validate_decoding(mode, temperature)
-        if open_decoding not in OPEN_DECODINGS:
-            raise ValueError(f"open_decoding must be one of {OPEN_DECODINGS}")
-        # "grammar": SGLang decodes each number, and a nullable string's null, in
-        # one constrained request. "stepwise": TypeLLM scores every token itself,
-        # among only the tokenizer's canonical starts; one request per token.
-        self.open_decoding = open_decoding
         if type(numeric_max_digits) is not int or numeric_max_digits <= 0:
             raise ValueError("numeric_max_digits must be a positive integer")
         self.sglang = SGLangClient(
@@ -212,7 +166,6 @@ class TypeLLMClient:
             model,
             timeout,
             tokenizer=tokenizer,
-            numeric_cache_dir=numeric_cache_dir,
             thinking=thinking,
             thinking_budget=thinking_budget,
             text_max_tokens=text_max_tokens,
@@ -439,7 +392,6 @@ class TypeLLMClient:
                         self.sglang, context, decisions, active_mode,
                         active_temperature, rng, self.numeric_max_digits,
                         image_count=len(encoded_images),
-                        open_decoding=self.open_decoding,
                     )
             finally:
                 self._last_usage.set(scope.usage)
@@ -497,29 +449,6 @@ def _validate_decoding(mode: str, temperature: float) -> None:
         raise ValueError("temperature must be finite and > 0 in sample mode")
 
 
-def _numeric_candidates(
-    text: str, numeric_type: str, max_digits: int
-) -> tuple[str, ...]:
-    """Return the next characters admitted by a small JSON-number state machine."""
-    digit_count = sum(char.isdigit() for char in text)
-    if digit_count >= max_digits:
-        return ()
-    if text in {"", "-"}:
-        return tuple(("-" if not text else "") + digits)
-
-    unsigned = text[1:] if text.startswith("-") else text
-    if numeric_type == "integer":
-        if unsigned == "0":
-            return ()
-        return tuple(digits)
-
-    if "." in unsigned:
-        return tuple(digits)
-    if unsigned == "0":
-        return (".",)
-    return tuple(digits + ".")
-
-
 def _numeric_text_is_complete(text: str, numeric_type: str) -> bool:
     if not text or text == "-":
         return False
@@ -536,65 +465,6 @@ def _numeric_text_is_complete(text: str, numeric_type: str) -> bool:
         return unsigned.isdigit()
     integer, fraction = unsigned.split(".", 1)
     return integer.isdigit() and bool(fraction) and fraction.isdigit()
-
-
-def _numeric_text_is_prefix(text: str, numeric_type: str) -> bool:
-    """Whether text can still be extended into a supported JSON-style number."""
-    if text in {"", "-"}:
-        return True
-    unsigned = text[1:] if text.startswith("-") else text
-    if not unsigned or unsigned.count(".") > 1:
-        return False
-    integer, separator, fraction = unsigned.partition(".")
-    if not integer.isdigit():
-        return False
-    if len(integer) > 1 and integer.startswith("0"):
-        return False
-    if numeric_type == "integer":
-        return not separator
-    return not separator or not fraction or fraction.isdigit()
-
-
-def _numeric_transition(
-    text: str, piece: str, numeric_type: str, max_digits: int
-) -> tuple[str, bool] | None:
-    """Apply one tokenizer piece, rejecting grammar-invalid continuations."""
-    if '"' in piece:
-        return None
-    value_text = text + piece
-    digit_count = sum(char.isdigit() for char in value_text)
-    # A trailing "." at the digit limit could never be completed.
-    if digit_count > max_digits or (
-        digit_count == max_digits and value_text.endswith(".")
-    ):
-        return None
-    return (
-        (value_text, False)
-        if _numeric_text_is_prefix(value_text, numeric_type)
-        else None
-    )
-
-
-def _numeric_token_candidates(
-    client: SGLangClient, text: str, numeric_type: str, max_digits: int
-) -> dict[int, tuple[str, str, bool]]:
-    """Map valid next token IDs to (decoded piece, next text, is finished)."""
-    if hasattr(client, "numeric_token_pieces"):
-        pieces = client.numeric_token_pieces()
-    else:
-        # Compatibility for small custom clients written against the first
-        # prototype. Native SGLangClient always uses its model-derived table.
-        pieces = [
-            client.single_token(piece)
-            for piece in _numeric_candidates(text, numeric_type, max_digits)
-        ]
-    candidates: dict[int, tuple[str, str, bool]] = {}
-    for token_id, piece in pieces:
-        transition = _numeric_transition(text, piece, numeric_type, max_digits)
-        if transition is not None:
-            next_text, finished = transition
-            candidates[int(token_id)] = (piece, next_text, finished)
-    return candidates
 
 
 def _parse_numeric_value(text: str, decision: Choice) -> int | float:
@@ -618,15 +488,12 @@ def _parse_numeric_value(text: str, decision: Choice) -> int | float:
     return value
 
 
-OPEN_DECODINGS = ("grammar", "stepwise")
-
-
 def numeric_pattern(numeric_type: str, max_digits: int, nullable: bool = False) -> str:
     """The regex a grammar backend decodes a prefilled number with, after '{"name":'.
 
-    It admits what the stepwise decoder admits: an optional sign, no leading
-    zeros, no exponent, at most max_digits digits in all; the value ends with
-    the object's '}' or the end of the message.
+    It admits JSON-style numbers: an optional sign, no leading zeros, no
+    exponent, at most max_digits digits in all; the value ends with the
+    object's '}' or the end of the message.
     """
     if numeric_type == "integer":
         body = "(?:0|[1-9][0-9]{0,%d})" % (max_digits - 1)
@@ -672,148 +539,6 @@ def _generate_numeric_batch(
         LOG.info("numeric name=%s grammar_text=%r value=%r", decision.name, raw, value)
         outputs.append((value, prompt + " " + text + "}", text))
     return outputs
-
-
-def _decode_numeric_batch(
-    client: SGLangClient,
-    items: Sequence[tuple[str, Choice]],
-    mode: str,
-    temperature: float,
-    rng: random.Random,
-    max_digits: int,
-) -> list[tuple[int | float | None, str, str]]:
-    """Decode numeric fields in lockstep: one batched request per step.
-
-    A field prefilled with {"name": first takes a sign step at the key: the model
-    picks among the tokens this tokenizer starts a positive or negative number
-    with (and null, when nullable), then its digits follow.
-    """
-    end_token_id, end_token_text = client.end_of_message_token()
-    prefilled = any(d.answer_prefill for _, d in items)
-    # After a prefilled {"name": the number ends where the object closes.
-    close_id, close_text = client.single_token("}") if prefilled else (None, "")
-    starts = client.json_value_starts() if prefilled and hasattr(client, "json_value_starts") else None
-    prefixes, signing = [], []
-    for prompt, decision in items:
-        sign_step = bool(decision.answer_prefill and starts and starts["positive"])
-        if decision.nullable and not (sign_step and starts["null"]):
-            raise ValueError(f"Nullable number {decision.name!r} needs a tokenizer that starts null "
-                             'and numbers with single tokens after \'{"name":\'')
-        prefixes.append(prompt if sign_step or not decision.answer_prefill else prompt + " ")
-        signing.append(sign_step)
-    texts = [""] * len(items)
-    unsigned = [False] * len(items)  # sign already chosen: no leading "-" in the digits
-    outputs: list[tuple[int | float | None, str, str] | None] = [None] * len(items)
-    step = 0
-    while any(output is None for output in outputs):
-        active = []
-        for i, (_, decision) in enumerate(items):
-            if outputs[i] is not None:
-                continue
-            if signing[i]:
-                # A digit or "-" written right after the colon ({"k":7}) is valid
-                # JSON too; rare, but kept so no way of starting a number is lost.
-                candidates = {token: ("direct", piece, next_text) for token, (piece, next_text, _) in
-                              _numeric_token_candidates(client, "", decision.numeric_type or "", max_digits).items()}
-                candidates.update({token: ("positive", piece, "") for token, piece in starts["positive"]})
-                candidates.update({token: ("negative", piece, "-") for token, piece in starts["negative"]})
-                if decision.nullable:
-                    candidates.update({token: ("null", piece, "null") for token, piece in starts["null"]})
-                active.append((i, candidates, list(candidates)))
-                continue
-            candidates = _numeric_token_candidates(
-                client, texts[i], decision.numeric_type or "", max_digits
-            )
-            if unsigned[i] and texts[i] == "":
-                candidates = {k: v for k, v in candidates.items() if not v[1].startswith("-")}
-            if _numeric_text_is_complete(texts[i], decision.numeric_type or ""):
-                candidates[end_token_id] = (end_token_text, texts[i], True)
-                if decision.answer_prefill:
-                    candidates[close_id] = (close_text, texts[i], True)
-            if not candidates:
-                raise ValueError(
-                    f"Could not complete numeric field {decision.name!r} within "
-                    f"{max_digits} digits"
-                )
-            active.append((i, candidates, list(candidates)))
-        if len(active) == 1:
-            i, _, ids = active[0]
-            by_id, meta, elapsed = client.score_candidates(prefixes[i] + texts[i], ids)
-            scored = [(by_id, meta)]
-        else:
-            scored, elapsed = client.score_candidates_batch(
-                [prefixes[i] + texts[i] for i, _, _ in active], [ids for _, _, ids in active]
-            )
-        for (i, candidates, ids), (by_id, meta) in zip(active, scored):
-            decision = items[i][1]
-            raw = {str(token_id): by_id[token_id] for token_id in ids}
-            probs = candidate_softmax(
-                raw, temperature if mode == "sample" else 1.0
-            )
-            if signing[i]:
-                signing[i] = False
-                null_keys = [k for k in probs if candidates[int(k)][0] == "null"]
-                p_null = math.fsum(probs[k] for k in null_keys)
-                # Null asks "is there a value?": compare it with all the ways a value
-                # can start, not with the single most likely start. The starts are
-                # added up before temperature applies, as for strings.
-                if decision.nullable:
-                    grouped = candidate_softmax(
-                        {"null": _logsumexp([raw[k] for k in null_keys]),
-                         "value": _logsumexp([v for k, v in raw.items() if k not in null_keys])},
-                        temperature if mode == "sample" else 1.0)
-                    choice = _choose(grouped, mode, rng)
-                    LOG.info("numeric name=%s start=%s p_null=%.4f", decision.name, choice, grouped["null"])
-                    if choice == "null":
-                        # Either null token counts; the prompt keeps the canonical {"name": null}.
-                        outputs[i] = (None, prefixes[i] + " null}", "null")
-                        continue
-                value_probs = {k: p / (1 - p_null) for k, p in probs.items() if k not in null_keys}
-                kind, piece, next_text = candidates[int(_choose(value_probs, mode, rng))]
-                # Text, not tokens, goes to the server: ' -' + digits reads as the
-                # prompt ' ' + '-' + digits, which the server tokenizes naturally.
-                if kind == "negative":
-                    prefixes[i] += piece[:-1]
-                elif kind == "positive":
-                    prefixes[i] += piece
-                    unsigned[i] = bool(starts["negative"])
-                texts[i] = next_text
-                continue
-            selected_key = (
-                max(raw, key=raw.__getitem__)
-                if mode == "argmax"
-                else _sample(probs, rng)
-            )
-            selected_id = int(selected_key)
-            selected_piece, next_text, finished = candidates[selected_id]
-            ranked = sorted(ids, key=by_id.__getitem__, reverse=True)[:20]
-            LOG.info(
-                "numeric name=%s step=%d candidates=%d top_candidates=%s "
-                "selected_id=%d selected=%r elapsed=%.4fs cached_tokens=%s",
-                decision.name,
-                step,
-                len(ids),
-                [
-                    {
-                        "id": token_id,
-                        "text": candidates[token_id][0],
-                        "logprob": by_id[token_id],
-                        "probability": probs[str(token_id)],
-                    }
-                    for token_id in ranked
-                ],
-                selected_id,
-                selected_piece,
-                elapsed,
-                meta.get("cached_tokens"),
-            )
-            LOG.debug("numeric candidate_logprobs=%s probabilities=%s", raw, probs)
-            texts[i] = next_text
-            if finished:
-                outputs[i] = (_parse_numeric_value(next_text, decision),
-                              prefixes[i] + next_text + selected_piece, next_text)
-        step += 1
-    return outputs  # type: ignore[return-value]
 
 
 def _balanced_orders(count: int) -> list[tuple[int, ...]]:
@@ -888,7 +613,7 @@ def _mean_order_probabilities(scored, orders, label_tokens, temperature):
 
 def _execute_dependency_decisions(
     client, context, decisions, mode, temperature, rng, numeric_max_digits,
-    image_count=0, open_decoding="grammar",
+    image_count=0,
 ):
     rows_by_name = {}
     prompts_by_name = {}
@@ -916,7 +641,6 @@ def _execute_dependency_decisions(
             dependency_values=dependency_values,
             parent_prefixes=parent_prefixes,
             image_count=image_count,
-            open_decoding=open_decoding,
         )
         for decision, row, prompt in zip(layer, rows, prompts):
             rows_by_name[decision.name] = row
@@ -936,11 +660,7 @@ def _execute_batch_decisions(
     dependency_values: Mapping[str, Mapping[str, Any]] | None = None,
     parent_prefixes: Mapping[str, str] | None = None,
     image_count: int = 0,
-    open_decoding: str = "grammar",
 ) -> tuple[list[dict], list[str]]:
-    # Grammar decoding needs a client that can run constrained generation.
-    grammar = open_decoding == "grammar" and callable(getattr(client, "generate_numbers", None))
-
     def question_content(decision):
         content = decision.opening_text()
         values = (dependency_values or {}).get(decision.name, {})
@@ -1048,27 +768,14 @@ def _execute_batch_decisions(
 
     open_pending = [(index, decision, messages, ready[decision_slots[index]])
                     for index, decision, messages in numeric_pending + text_pending]
-    # With grammar decoding a nullable string writes null or the string in one
-    # request; stepwise first weighs null against every way a string starts.
-    nullable = [item for item in open_pending if item[1].nullable and item[1].text_type
-                and not (grammar and item[1].answer_prefill)]
-    if nullable:
-        nulls = _decide_nulls(
-            client, [(prompt + decision.answer_prefill, decision) for _, decision, _, prompt in nullable],
-            mode, temperature, rng)
-        for (index, decision, messages, prompt), is_null in zip(nullable, nulls):
-            if is_null:
-                open_results[index] = (open_row(decision, None),
-                                       complete(prompt, messages, _closed_answer(decision, "null")))
-    open_pending = [item for item in open_pending if item[0] not in open_results]
     numeric_pending = [item for item in open_pending if item[1].numeric_type is not None]
     text_pending = [item for item in open_pending if item[1].text_type]
 
     if numeric_pending:
-        items = [(prompt + decision.answer_prefill, decision) for _, decision, _, prompt in numeric_pending]
-        by_grammar = grammar and all(decision.answer_prefill for _, decision in items)
-        decoded = (_generate_numeric_batch if by_grammar else _decode_numeric_batch)(
-            client, items, mode, temperature, rng, numeric_max_digits,
+        decoded = _generate_numeric_batch(
+            client,
+            [(prompt + decision.answer_prefill, decision) for _, decision, _, prompt in numeric_pending],
+            mode, temperature, rng, numeric_max_digits,
         )
         for (index, decision, messages, prompt), (value, _completed, generated_text) in zip(numeric_pending, decoded):
             open_results[index] = (open_row(decision, value),
@@ -1076,16 +783,14 @@ def _execute_batch_decisions(
 
     if text_pending:
         values = client.generate_texts(
-            # From {"name": the model picks the string's first token, quote included,
-            # among the same starts the null decision weighed.
+            # From {"name": the model writes the string's first token, quote included.
             [prompt + decision.answer_prefill for _, decision, _, prompt in text_pending],
             [decision.max_length for _, decision, _, _ in text_pending],
             temperature=0 if mode == "argmax" else temperature,
             seed=rng.randrange(2**31),
             after_key=all(decision.answer_prefill for _, decision, _, _ in text_pending),
-            # Only fields the null step above did not already decide.
-            **({"nullable": [grammar and decision.nullable for _, decision, _, _ in text_pending]}
-               if grammar and any(decision.nullable for _, decision, _, _ in text_pending) else {}),
+            # A nullable string writes null or its text in the same request.
+            nullable=[decision.nullable for _, decision, _, _ in text_pending],
         )
         for (index, decision, messages, prompt), value in zip(text_pending, values):
             completed = complete(prompt, messages, _closed_answer(decision, json.dumps(value, ensure_ascii=False)))
@@ -1195,11 +900,9 @@ def run_schema(
     seed: int | None = None,
     numeric_max_digits: int = 32,
     tokenizer: str | None = None,
-    numeric_cache_dir: str | os.PathLike[str] | None = None,
     thinking: bool = False,
     thinking_budget: int | None = None,
     text_max_tokens: int = 512,
-    open_decoding: str = "grammar",
     print_final_prompt: bool = False,
 ) -> dict[str, Any]:
     client = TypeLLMClient(
@@ -1210,11 +913,9 @@ def run_schema(
         seed=seed,
         numeric_max_digits=numeric_max_digits,
         tokenizer=tokenizer,
-        numeric_cache_dir=numeric_cache_dir,
         thinking=thinking,
         thinking_budget=thinking_budget,
         text_max_tokens=text_max_tokens,
-        open_decoding=open_decoding,
     )
     return client.generate(
         context=context,
