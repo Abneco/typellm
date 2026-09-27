@@ -744,35 +744,26 @@ class SGLangClient:
             results.append((scores, meta if isinstance(meta, Mapping) else {}))
         return results, elapsed
 
-    def generate_numbers(
-        self,
-        prefixes: Sequence[str],
-        patterns: Sequence[str],
-        max_new_tokens: int,
-        *,
-        temperature: float = 0,
-        seed: int = 0,
-    ) -> list[str]:
-        """Generate one regex-constrained value per prompt in a native batch.
-
-        SGLang masks every step to the pattern, so a number takes one request
-        instead of one per token. Returns the raw generated text.
-        """
-        if len(prefixes) != len(patterns):
-            raise ValueError("prefixes and patterns must have the same length")
-        if not prefixes:
-            return []
-        params = [{"max_new_tokens": max_new_tokens, "temperature": temperature,
-                   "top_p": 1.0, "top_k": -1, "min_p": 0.0,
-                   "sampling_seed": seed + i, "regex": pattern}
-                  for i, pattern in enumerate(patterns)]
-        response = self._generate({"text": list(prefixes), "sampling_params": params})
+    def _batch(self, prefixes: Sequence[str], params: Sequence[Mapping[str, Any]], what: str) -> list[Any]:
+        """One /generate request with one sampling-params dict per prompt."""
+        response = self._generate({"text": list(prefixes), "sampling_params": list(params)})
         if isinstance(response, Mapping) and len(prefixes) == 1:
             response = [response]
         if not isinstance(response, list) or len(response) != len(prefixes):
-            raise SGLangError("Unexpected number batch response shape")
+            raise SGLangError(f"Unexpected {what} batch response shape")
+        return response
+
+    @staticmethod
+    def _number_params(patterns: Sequence[str], max_new_tokens: int, temperature: float, seed: int) -> list[dict]:
+        return [{"max_new_tokens": max_new_tokens, "temperature": temperature,
+                 "top_p": 1.0, "top_k": -1, "min_p": 0.0,
+                 "sampling_seed": seed + i, "regex": pattern}
+                for i, pattern in enumerate(patterns)]
+
+    @staticmethod
+    def _read_numbers(items: Sequence[Any]) -> list[str]:
         texts = []
-        for item in response:
+        for item in items:
             meta = item.get("meta_info", {}) if isinstance(item, Mapping) else {}
             finish = meta.get("finish_reason", {}) if isinstance(meta, Mapping) else {}
             kind = finish.get("type") if isinstance(finish, Mapping) else finish
@@ -782,34 +773,10 @@ class SGLangClient:
             texts.append(text)
         return texts
 
-    def generate_texts(
-        self,
-        prefixes: Sequence[str],
-        max_lengths: Sequence[int | None],
-        *,
-        temperature: float = 0,
-        seed: int = 0,
-        after_key: bool = False,
-        nullable: Sequence[bool] | None = None,
-    ) -> list[str | None]:
-        """Generate JSON strings in a native batch, then validate every value.
-
-        With after_key, every prompt ends with '{"name":', and the model writes the
-        opening quote, the characters and the closing '"}'. Writing the quote
-        itself lets it start with a merged token such as ' "$', which keeps the
-        first character. A max length then truncates: generation is capped near
-        that many tokens and the string is cut to that many characters, as a
-        length-bounded grammar would.
-        """
-        if len(prefixes) != len(max_lengths):
-            raise ValueError("prefixes and max_lengths must have the same length")
-        nullable = [False] * len(prefixes) if nullable is None else list(nullable)
-        if len(nullable) != len(prefixes):
-            raise ValueError("prefixes and nullable must have the same length")
+    def _text_params(self, max_lengths: Sequence[int | None], nullable: Sequence[bool],
+                     after_key: bool, temperature: float, seed: int) -> list[dict]:
         if any(nullable) and not after_key:
             raise ValueError("nullable text needs the prefilled '{\"name\":' prompt")
-        if not prefixes:
-            return []
         params = []
         for limit, can_be_null in zip(max_lengths, nullable):
             budget = self.text_max_tokens
@@ -832,13 +799,13 @@ class SGLangClient:
                 constraint = {"json_schema": json.dumps(schema)}
             params.append({"max_new_tokens": budget,
                            "temperature": temperature, "sampling_seed": seed, **constraint})
-        response = self._generate({"text": list(prefixes), "sampling_params": params})
-        if isinstance(response, Mapping) and len(prefixes) == 1:
-            response = [response]
-        if not isinstance(response, list) or len(response) != len(prefixes):
-            raise SGLangError("Unexpected text batch response shape")
+        return params
+
+    @staticmethod
+    def _read_texts(items: Sequence[Any], max_lengths: Sequence[int | None],
+                    nullable: Sequence[bool], after_key: bool) -> list[str | None]:
         values: list[str | None] = []
-        for item, limit, can_be_null in zip(response, max_lengths, nullable):
+        for item, limit, can_be_null in zip(items, max_lengths, nullable):
             if not isinstance(item, Mapping):
                 raise SGLangError("Invalid text response")
             meta = item.get("meta_info", {})
@@ -873,6 +840,93 @@ class SGLangClient:
                 raise SGLangError("Text generation exceeded maxLength")
             values.append(value)
         return values
+
+    @staticmethod
+    def _check_lengths(nullable, prefixes, max_lengths):
+        if len(prefixes) != len(max_lengths):
+            raise ValueError("prefixes and max_lengths must have the same length")
+        nullable = [False] * len(prefixes) if nullable is None else list(nullable)
+        if len(nullable) != len(prefixes):
+            raise ValueError("prefixes and nullable must have the same length")
+        return nullable
+
+    def generate_numbers(
+        self,
+        prefixes: Sequence[str],
+        patterns: Sequence[str],
+        max_new_tokens: int,
+        *,
+        temperature: float = 0,
+        seed: int = 0,
+    ) -> list[str]:
+        """Generate one regex-constrained value per prompt in a native batch.
+
+        SGLang masks every step to the pattern, so a number takes one request
+        instead of one per token. Returns the raw generated text.
+        """
+        if len(prefixes) != len(patterns):
+            raise ValueError("prefixes and patterns must have the same length")
+        if not prefixes:
+            return []
+        params = self._number_params(patterns, max_new_tokens, temperature, seed)
+        return self._read_numbers(self._batch(prefixes, params, "number"))
+
+    def generate_texts(
+        self,
+        prefixes: Sequence[str],
+        max_lengths: Sequence[int | None],
+        *,
+        temperature: float = 0,
+        seed: int = 0,
+        after_key: bool = False,
+        nullable: Sequence[bool] | None = None,
+    ) -> list[str | None]:
+        """Generate JSON strings in a native batch, then validate every value.
+
+        With after_key, every prompt ends with '{"name":', and the model writes the
+        opening quote, the characters and the closing '"}'. Writing the quote
+        itself lets it start with a merged token such as ' "$', which keeps the
+        first character. A max length then truncates: generation is capped near
+        that many tokens and the string is cut to that many characters, as a
+        length-bounded grammar would.
+        """
+        nullable = self._check_lengths(nullable, prefixes, max_lengths)
+        if not prefixes:
+            return []
+        params = self._text_params(max_lengths, nullable, after_key, temperature, seed)
+        return self._read_texts(self._batch(prefixes, params, "text"), max_lengths, nullable, after_key)
+
+    def generate_fields(
+        self,
+        number_prefixes: Sequence[str],
+        patterns: Sequence[str],
+        number_max_tokens: int,
+        text_prefixes: Sequence[str],
+        max_lengths: Sequence[int | None],
+        *,
+        temperature: float = 0,
+        number_seed: int = 0,
+        text_seed: int = 0,
+        after_key: bool = False,
+        nullable: Sequence[bool] | None = None,
+    ) -> tuple[list[str], list[str | None]]:
+        """Numbers and strings of one layer in a single request, decoded side by side.
+
+        Returns what generate_numbers and generate_texts would for each part.
+        """
+        if len(number_prefixes) != len(patterns):
+            raise ValueError("prefixes and patterns must have the same length")
+        nullable = self._check_lengths(nullable, text_prefixes, max_lengths)
+        params = (self._number_params(patterns, number_max_tokens, temperature, number_seed)
+                  + (self._text_params(max_lengths, nullable, after_key, temperature, text_seed)
+                     if text_prefixes else []))
+        prefixes = list(number_prefixes) + list(text_prefixes)
+        if not prefixes:
+            return [], []
+        items = self._batch(prefixes, params, "field")
+        split = len(number_prefixes)
+        return (self._read_numbers(items[:split]),
+                self._read_texts(items[split:], max_lengths, nullable, after_key))
 
     def flush_cache(self) -> None:
         reply = self._request("/flush_cache", {}, allow_text=True)

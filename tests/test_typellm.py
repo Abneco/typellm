@@ -60,6 +60,12 @@ class FakeSGLang:
         self.number_patterns.extend(patterns)
         return [next(self.numbers, " 7}") for _ in prefixes]
 
+    def generate_fields(self, number_prefixes, patterns, number_max_tokens, text_prefixes, max_lengths,
+                        *, temperature=0, number_seed=0, text_seed=0, after_key=False, nullable=None):
+        numbers = self.generate_numbers(number_prefixes, patterns, number_max_tokens)
+        texts = self.generate_texts(text_prefixes, max_lengths) if text_prefixes else []
+        return numbers, texts
+
     def score_candidates(self, prefix, candidate_ids):
         self.prompts.append(prefix)
         self.candidate_sets.append(list(candidate_ids))

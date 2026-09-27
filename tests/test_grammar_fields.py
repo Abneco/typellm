@@ -5,7 +5,7 @@ import unittest
 from typellm import SGLangError, TypeLLMClient
 from typellm.runtime import _numeric_text_is_complete, numeric_pattern
 
-from tests.test_batching import FakeServer, width
+from tests.test_batching import FakeServer, is_number_pattern, width
 from tests.test_nullable import NullServer
 
 
@@ -71,6 +71,20 @@ class GrammarNumberTests(unittest.TestCase):
         self.assertTrue(all(t.endswith('":') for t in numbers["text"]))
         self.assertEqual(numbers["sampling_params"][0]["temperature"], 0)
         self.assertIn('{"a": 7}', client.last_prompts[0])
+
+    def test_numbers_and_strings_of_a_layer_share_one_request(self):
+        client = TypeLLMClient(model="fake")
+        client.sglang = FakeServer()
+        result = client.generate(context="Receipt", questions={
+            "a": {"type": "integer"}, "n": {"type": "string"},
+            "b": {"type": "number"}, "m": {"type": ["string", "null"]}})
+        self.assertEqual(result, {"a": 7, "n": "blue", "b": 7, "m": "blue"})
+        [request] = regex_requests(client.sglang)
+        self.assertEqual(width(request), 4)
+        patterns = [p["regex"] for p in request["sampling_params"]]
+        self.assertEqual([is_number_pattern(p) for p in patterns], [True, True, False, False])
+        self.assertTrue(all(t.endswith(k) for t, k in zip(request["text"], ('{"a":', '{"b":', '{"n":', '{"m":'))))
+        self.assertIn("null", patterns[3])
 
     def test_sampling_passes_the_temperature_and_no_truncation(self):
         client = TypeLLMClient(model="fake", mode="sample", temperature=0.7, seed=1)

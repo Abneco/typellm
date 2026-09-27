@@ -510,23 +510,10 @@ def numeric_pattern(numeric_type: str, max_digits: int, nullable: bool = False) 
     return " ?" + value + r"\}?"
 
 
-def _generate_numeric_batch(
-    client: SGLangClient,
-    items: Sequence[tuple[str, Choice]],
-    mode: str,
-    temperature: float,
-    rng: random.Random,
-    max_digits: int,
+def _parse_numbers(
+    items: Sequence[tuple[str, Choice]], texts: Sequence[str],
 ) -> list[tuple[int | float | None, str, str]]:
-    """Decode prefilled numeric fields in one grammar-constrained batch request."""
-    patterns = [numeric_pattern(d.numeric_type or "", max_digits, d.nullable) for _, d in items]
-    texts = client.generate_numbers(
-        [prompt for prompt, _ in items], patterns,
-        # Digits, sign, point and the closing brace; tokens hold one or more characters.
-        max_new_tokens=max_digits + 4,
-        temperature=0 if mode == "argmax" else temperature,
-        seed=rng.randrange(2**31),
-    )
+    """Read the grammar-generated numbers: (value, closed prompt, value text)."""
     outputs = []
     for (prompt, decision), raw in zip(items, texts):
         text = raw.strip()
@@ -779,27 +766,31 @@ def _execute_batch_decisions(
     numeric_pending = [item for item in open_pending if item[1].numeric_type is not None]
     text_pending = [item for item in open_pending if item[1].text_type]
 
-    if numeric_pending:
-        decoded = _generate_numeric_batch(
-            client,
-            [(prompt + decision.answer_prefill, decision) for _, decision, _, prompt in numeric_pending],
-            mode, temperature, rng, numeric_max_digits,
-        )
-        for (index, decision, messages, prompt), (value, _completed, generated_text) in zip(numeric_pending, decoded):
-            open_results[index] = (open_row(decision, value),
-                                   complete(prompt, messages, _closed_answer(decision, generated_text)))
-
-    if text_pending:
-        values = client.generate_texts(
+    # A layer's numbers and strings decode side by side in one request.
+    if numeric_pending or text_pending:
+        number_items = [(prompt + decision.answer_prefill, decision)
+                        for _, decision, _, prompt in numeric_pending]
+        number_seed = rng.randrange(2**31) if numeric_pending else 0
+        text_seed = rng.randrange(2**31) if text_pending else 0
+        raw_numbers, values = client.generate_fields(
+            [prompt for prompt, _ in number_items],
+            [numeric_pattern(d.numeric_type or "", numeric_max_digits, d.nullable) for _, d in number_items],
+            # Digits, sign, point and the closing brace; tokens hold one or more characters.
+            numeric_max_digits + 4,
             # From {"name": the model writes the string's first token, quote included.
             [prompt + decision.answer_prefill for _, decision, _, prompt in text_pending],
             [decision.max_length for _, decision, _, _ in text_pending],
             temperature=0 if mode == "argmax" else temperature,
-            seed=rng.randrange(2**31),
+            number_seed=number_seed,
+            text_seed=text_seed,
             after_key=all(decision.answer_prefill for _, decision, _, _ in text_pending),
             # A nullable string writes null or its text in the same request.
             nullable=[decision.nullable for _, decision, _, _ in text_pending],
         )
+        for (index, decision, messages, prompt), (value, _completed, generated_text) in zip(
+                numeric_pending, _parse_numbers(number_items, raw_numbers)):
+            open_results[index] = (open_row(decision, value),
+                                   complete(prompt, messages, _closed_answer(decision, generated_text)))
         for (index, decision, messages, prompt), value in zip(text_pending, values):
             completed = complete(prompt, messages, _closed_answer(decision, json.dumps(value, ensure_ascii=False)))
             open_results[index] = (open_row(decision, value), completed)
