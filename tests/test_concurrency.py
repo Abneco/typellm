@@ -42,7 +42,7 @@ class SharedClientTests(unittest.TestCase):
         def run(n):
             client.generate(context=f"Receipt {n}", questions={
                 "a": {"type": "integer"}, "b": {"type": "boolean"},
-            })
+            }).result
             finished.wait()  # Every call has finished before any reads its prompts.
             return n, client.last_prompts
 
@@ -56,21 +56,21 @@ class SharedClientTests(unittest.TestCase):
         client = TypeLLMClient(model="fake", seed=1)
         client.sglang = FakeServer()
         state = client.rng.getstate()
-        client.generate(context="Roll", questions=PICK, seed=5)
+        client.generate(context="Roll", questions=PICK, seed=5).result
         first = client.last_prompts
-        client.generate(context="Roll", questions=PICK, seed=5)
+        client.generate(context="Roll", questions=PICK, seed=5).result
         self.assertEqual(client.last_prompts, first)
         self.assertEqual(client.rng.getstate(), state)
-        client.generate(context="Roll", questions=PICK)
+        client.generate(context="Roll", questions=PICK).result
         self.assertNotEqual(client.rng.getstate(), state)
 
     def test_clients_pickle_after_a_call(self):
         client = TypeLLMClient(model="fake")
         client.sglang = FakeServer()
-        client.generate(context="Receipt", questions={"b": {"type": "boolean"}})
+        client.generate(context="Receipt", questions={"b": {"type": "boolean"}}).result
         copy = pickle.loads(pickle.dumps(client))
         self.assertEqual(copy.last_prompts, [])
-        copy.generate(context="Receipt", questions={"b": {"type": "boolean"}})
+        copy.generate(context="Receipt", questions={"b": {"type": "boolean"}}).result
         self.assertEqual(len(copy.last_prompts), 1)
 
 
@@ -102,19 +102,18 @@ class UsageTests(unittest.TestCase):
     def test_usage_sums_every_generate_request_of_the_call(self):
         client = TypeLLMClient(model="fake")
         client.sglang = MeteredServer()
-        self.assertIsNone(client.last_usage)
-        client.generate(context="Receipt", questions=self.QUESTIONS)
+        usage = client.generate(context="Receipt", questions=self.QUESTIONS).usage
         n = prompts_sent(client.sglang)
         # The input counts once, though every prompt carries it.
         sent = client.sglang.count_tokens("Receipt") + client.sglang.count_tokens(json.dumps(self.QUESTIONS))
-        self.assertEqual(client.last_usage, Usage(
+        self.assertEqual(usage, Usage(
             requests=len(client.sglang.payloads),
             prompt_tokens=10 * n, cached_tokens=4 * n, completion_tokens=n, input_tokens=sent,
         ))
-        self.assertGreater(client.last_usage.requests, 1)
+        self.assertGreater(usage.requests, 1)
         client.sglang.payloads.clear()
-        client.generate(context="Receipt", questions={"b": {"type": "boolean"}})
-        self.assertEqual(client.last_usage.requests, len(client.sglang.payloads))
+        usage = client.generate(context="Receipt", questions={"b": {"type": "boolean"}}).usage
+        self.assertEqual(usage.requests, len(client.sglang.payloads))
 
     def test_concurrent_calls_count_only_their_own_requests(self):
         client = TypeLLMClient(model="fake")
@@ -122,9 +121,9 @@ class UsageTests(unittest.TestCase):
         finished = threading.Barrier(4)
 
         def run(questions):
-            client.generate(context="Receipt", questions=questions)
+            usage = client.generate(context="Receipt", questions=questions).usage
             finished.wait()
-            return client.last_usage.requests
+            return usage.requests
 
         one = {"b": {"type": "boolean"}}
         with ThreadPoolExecutor(4) as pool:
@@ -137,13 +136,13 @@ class UsageTests(unittest.TestCase):
     def test_a_failed_call_still_reports_the_requests_it_made(self):
         client = TypeLLMClient(model="fake")
         client.sglang = MeteredServer(fail_after=2)
-        with self.assertRaisesRegex(SGLangError, "went away"):
+        with self.assertRaisesRegex(SGLangError, "went away") as caught:
             client.generate(context="Receipt", questions=self.QUESTIONS)
-        self.assertEqual(client.last_usage.requests, 2)
-        self.assertGreater(client.last_usage.input_tokens, 0)
-        with self.assertRaises(ValueError):
+        self.assertEqual(caught.exception.usage.requests, 2)
+        self.assertGreater(caught.exception.usage.input_tokens, 0)
+        with self.assertRaises(ValueError) as caught:
             client.generate(questions=self.QUESTIONS)
-        self.assertIsNone(client.last_usage)
+        self.assertFalse(hasattr(caught.exception, "usage"))  # refused before any work
 
 
 class DeadlineTests(unittest.TestCase):
@@ -158,13 +157,13 @@ class DeadlineTests(unittest.TestCase):
 
         client = TypeLLMClient(model="fake")
         client.sglang = Slower()
-        client.generate(context="Receipt", questions=self.QUESTIONS)
+        client.generate(context="Receipt", questions=self.QUESTIONS).result
         needed = len(client.sglang.payloads)
         client.sglang.payloads.clear()
-        with self.assertRaises(GenerationTimeout):
+        with self.assertRaises(GenerationTimeout) as caught:
             client.generate(context="Receipt", questions=self.QUESTIONS, timeout=0.05)
         self.assertLess(len(client.sglang.payloads), needed)
-        self.assertEqual(client.last_usage.requests, len(client.sglang.payloads))
+        self.assertEqual(caught.exception.usage.requests, len(client.sglang.payloads))
 
     def test_a_cancelled_call_sends_no_further_requests(self):
         cancel = threading.Event()
@@ -179,7 +178,7 @@ class DeadlineTests(unittest.TestCase):
         client = TypeLLMClient(model="fake")
         client.sglang = Cancelling()
         with self.assertRaises(GenerationCancelled):
-            client.generate(context="Receipt", questions=self.QUESTIONS, cancel=cancel)
+            client.generate(context="Receipt", questions=self.QUESTIONS, cancel=cancel).result
         self.assertEqual(len(client.sglang.payloads), 2)
 
     def test_socket_timeouts_never_outlast_the_call(self):
@@ -256,7 +255,7 @@ class DeadlineTests(unittest.TestCase):
         for kwargs in ({"timeout": 0}, {"timeout": -1}, {"timeout": True}, {"timeout": "5"},
                        {"cancel": True}):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
-                client.generate(context="Receipt", questions={"b": {"type": "boolean"}}, **kwargs)
+                client.generate(context="Receipt", questions={"b": {"type": "boolean"}}, **kwargs).result
         self.assertEqual(client.sglang.paths, [])  # Rejected before even compiling.
 
 

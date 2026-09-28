@@ -81,7 +81,7 @@ client = TypeLLMClient(
 Example request:
 
 ```python
-result = client.generate(
+response = client.generate(
     context="""
     Receipt from Hilton London
     Total: £324.50
@@ -113,10 +113,12 @@ result = client.generate(
     },
 )
 
-print(result)
+print(response.result)
 ```
 
-Example output:
+`generate()` returns what the HTTP API does: the typed answers in `.result`, the
+reasoning of each field that thought in `.thinking`, and the call's tokens in
+`.usage`. Example `.result`:
 
 ```python
 {
@@ -150,7 +152,7 @@ result = client.generate(
     questions={
         "summary": {"type": "string", "instructions": "Summarize in one sentence."},
     },
-)
+).result
 ```
 
 Free text stops after 128 tokens. Pass `text_max_tokens=` to the client for
@@ -167,7 +169,7 @@ result = client.generate(
             "instructions": "What is 17.5 multiplied by 4?",
         },
     },
-)
+).result
 
 print(result)
 # {"answer": 70.0}
@@ -205,7 +207,7 @@ result = client.generate(
         "card": {"type": ["string", "null"], "enum": ["VISA", "MASTERCARD", None],
                  "instructions": "Card network, if paid by card."},
     },
-)
+).result
 # {"tip": None, "table": "7A", "paid_in_cash": False, "card": None}
 ```
 
@@ -221,7 +223,7 @@ Thinking is off by default. Turn it on for the fields that need it; the others
 answer at once, and the fields that think reason side by side:
 
 ```python
-result = client.generate(context=context, questions={
+response = client.generate(context=context, questions={
     "total": {"type": "number"},
     "category": {"type": "string", "enum": ["meal", "travel", "equipment"]},
     "policy_ok": {"type": "boolean", "instructions": "Does it meet the travel policy?",
@@ -229,13 +231,12 @@ result = client.generate(context=context, questions={
 })
 ```
 
-`thinking_budget` caps a field's reasoning; there is no budget by default.
-`TypeLLMClient(..., thinking_budget=2048)` sets one for every field that thinks
-without its own. When reasoning reaches the budget, TypeLLM closes it and moves
-on to the typed answer.
+`thinking_budget` caps a field's reasoning. Without one, a field may reason until
+the model's context is full. When reasoning reaches the budget, TypeLLM closes it
+and moves on to the typed answer.
 
-After a call, `client.last_thinking` maps each field that thought to its
-reasoning, and `client.last_usage.thinking_tokens` counts the reasoning tokens.
+`response.thinking` maps each field that thought to its reasoning, and
+`response.usage.thinking_tokens` counts the reasoning tokens.
 
 Models with always-on thinking reason on every field; `thinking_budget` applies
 to them too. See [Supported models](#supported-models).
@@ -253,7 +254,7 @@ result = client.generate(
         "total": {"type": "number", "instructions": "What is the receipt total?"},
         "paid": {"type": "boolean", "instructions": "Is the receipt marked as paid?"},
     },
-)
+).result
 ```
 
 Each image can be a local file path, an http(s) URL, a `data:` URI, raw bytes,
@@ -291,7 +292,7 @@ result = client.generate(
             "depends_on": ["severity", "deployment_related"],
         },
     },
-)
+).result
 ```
 
 This runs `system`, then `severity` and `deployment_related`, then `rollback`.
@@ -313,7 +314,7 @@ result = client.generate(
             "return_probabilities": True,
         },
     },
-)
+).result
 ```
 
 ```python
@@ -361,7 +362,7 @@ result = run_schema(
     questions=questions,
     base_url="http://127.0.0.1:30000",
     model="Qwen/Qwen3.8-27B",
-)
+).result
 ```
 
 ### Per-question permutation averaging
@@ -378,7 +379,7 @@ result = client.generate(
         "permutations": "auto",
         "return_probabilities": True,
     }},
-)
+).result
 ```
 
 - `"auto"` evaluates a balanced set of orderings: each option takes every position,
@@ -402,19 +403,19 @@ prompts and usage, and connections to SGLang are reused.
 import threading
 
 cancel = threading.Event()
-result = client.generate(
+response = client.generate(
     context=context,
     questions=questions,
     seed=7,          # this call's random choices only
     timeout=30,      # seconds for the whole call; raises GenerationTimeout
     cancel=cancel,   # set it from another thread; raises GenerationCancelled
 )
-print(client.last_usage)
+print(response.usage)
 # Usage(requests=4, prompt_tokens=1830, cached_tokens=1504, completion_tokens=7, thinking_tokens=0, input_tokens=410)
 ```
 
-`last_usage` reports the tokens of the last call made in the current thread,
-including a call that failed partway. `input_tokens` is what you sent, each part
+`usage` reports the tokens of the call. When a call fails partway, the
+exception's `.usage` holds what it spent. `input_tokens` is what you sent, each part
 counted once: the context, the questions as JSON, and the images. The other
 counts are SGLang's for the call's requests, where every prompt carries the
 shared context. A timeout or cancel stops

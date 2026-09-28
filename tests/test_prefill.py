@@ -15,7 +15,7 @@ class PrefillTests(unittest.TestCase):
     def run_generate(self, questions, **kwargs):
         client = TypeLLMClient(model="fake")
         client.sglang = FakeServer()
-        result = client.generate(context="Receipt", questions=questions, **kwargs)
+        result = client.generate(context="Receipt", questions=questions, **kwargs).result
         return client, result
 
     def test_open_fields_continue_from_a_prefilled_key(self):

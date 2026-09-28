@@ -63,7 +63,7 @@ class GrammarNumberTests(unittest.TestCase):
     def test_every_number_of_a_layer_takes_one_request(self):
         client = TypeLLMClient(model="fake")
         client.sglang = FakeServer()
-        result = client.generate(context="Receipt", questions=self.QUESTIONS)
+        result = client.generate(context="Receipt", questions=self.QUESTIONS).result
         self.assertEqual(result, {"a": 7, "b": 7, "c": 7})
         self.assertEqual(client.sglang.requests("score"), [])
         [numbers] = regex_requests(client.sglang)
@@ -77,7 +77,7 @@ class GrammarNumberTests(unittest.TestCase):
         client.sglang = FakeServer()
         result = client.generate(context="Receipt", questions={
             "a": {"type": "integer"}, "n": {"type": "string"},
-            "b": {"type": "number"}, "m": {"type": ["string", "null"]}})
+            "b": {"type": "number"}, "m": {"type": ["string", "null"]}}).result
         self.assertEqual(result, {"a": 7, "n": "blue", "b": 7, "m": "blue"})
         [request] = regex_requests(client.sglang)
         self.assertEqual(width(request), 4)
@@ -89,14 +89,14 @@ class GrammarNumberTests(unittest.TestCase):
     def test_sampling_passes_the_temperature_and_no_truncation(self):
         client = TypeLLMClient(model="fake", temperature=0.7, seed=1)
         client.sglang = FakeServer()
-        client.generate(context="Receipt", questions={"a": {"type": "integer"}})
+        client.generate(context="Receipt", questions={"a": {"type": "integer"}}).result
         [params] = regex_requests(client.sglang)[0]["sampling_params"]
         self.assertEqual((params["temperature"], params["top_p"], params["top_k"]), (0.7, 1.0, -1))
 
     def test_nullable_numbers_can_be_null_in_the_same_request(self):
         client = TypeLLMClient(model="fake")
         client.sglang = NullServer()
-        result = client.generate(context="Receipt", questions={"tip": {"type": ["number", "null"]}})
+        result = client.generate(context="Receipt", questions={"tip": {"type": ["number", "null"]}}).result
         self.assertEqual(result, {"tip": None})
         self.assertEqual(client.sglang.requests("score"), [])
         self.assertIn('{"tip": null}', client.last_prompts[0])
@@ -107,14 +107,14 @@ class GrammarNumberTests(unittest.TestCase):
                 client = TypeLLMClient(model="fake")
                 client.sglang = ReplyServer(reply, finish)
                 with self.assertRaises(error):
-                    client.generate(context="Receipt", questions={"a": {"type": "number"}})
+                    client.generate(context="Receipt", questions={"a": {"type": "number"}}).result
 
     def test_negative_and_spaceless_numbers_parse(self):
         for reply, value in ((" -3.5}", -3.5), ("42}", 42.0), (" 0", 0.0)):
             with self.subTest(reply=reply):
                 client = TypeLLMClient(model="fake")
                 client.sglang = ReplyServer(reply)
-                self.assertEqual(client.generate(context="R", questions={"a": {"type": "number"}}),
+                self.assertEqual(client.generate(context="R", questions={"a": {"type": "number"}}).result,
                                  {"a": value})
 
 

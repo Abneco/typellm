@@ -42,7 +42,7 @@ class TextTests(unittest.TestCase):
         client.sglang=fake
         result=client.generate(state='context',questions={
             'a':{'type':'string'},'n':{'type':'integer'},
-            'b':{'type':'string','maxLength':10},'ok':{'type':'boolean','return_probabilities':True}})
+            'b':{'type':'string','maxLength':10},'ok':{'type':'boolean','return_probabilities':True}}).result
         self.assertEqual(list(result),['a','n','b','ok'])
         self.assertEqual([result['a'],result['n'],result['b'],result['ok']['value']],['alpha',7,'beta',True])
         self.assertIn(True,result['ok']['probabilities'])
@@ -56,7 +56,7 @@ class TextTests(unittest.TestCase):
         fake=FakeSGLang()
         fake.generate_texts=lambda prefixes,limits,**kwargs:['hello']*len(prefixes)
         with patch('typellm.runtime.SGLangClient',return_value=fake) as constructor:
-            self.assertEqual(run_schema(state='x',questions={'t':{'type':'string'}},text_max_tokens=24),{'t':'hello'})
+            self.assertEqual(run_schema(state='x',questions={'t':{'type':'string'}},text_max_tokens=24).result,{'t':'hello'})
             self.assertEqual(constructor.call_args.kwargs['text_max_tokens'],24)
         for budget in (0,-1,True):
             with self.assertRaises(ValueError):
@@ -69,7 +69,7 @@ class TextTests(unittest.TestCase):
         client.sglang._chat_tokenizer.apply_chat_template=lambda *args,**kw: "assistant\n<think>\n" if kw["enable_thinking"] else "completed"
         responses=[{'text':'brief</think>'},[{'text':' "done"}','meta_info':{'finish_reason':{'type':'stop'}}}]]
         with patch.object(client.sglang,'_request',side_effect=responses) as request:
-            self.assertEqual(client.generate(state='x',questions={'t':{'type':'string','thinking':True}}),{'t':'done'})
+            self.assertEqual(client.generate(state='x',questions={'t':{'type':'string','thinking':True}}).result,{'t':'done'})
             self.assertIn('</think>',request.call_args.args[1]['text'][0])
             self.assertTrue(request.call_args.args[1]['text'][0].endswith('{"t":'))
             self.assertIn('regex',request.call_args.args[1]['sampling_params'][0])

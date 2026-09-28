@@ -12,7 +12,6 @@ import warnings
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from decimal import Decimal
 from itertools import permutations as all_permutations
 from string import ascii_uppercase, digits
 from typing import Any, Mapping, Sequence
@@ -56,8 +55,6 @@ class Choice:
     name: str | None = None
     syntax: str = "Choice"
     numeric_type: str | None = None
-    minimum: int | float | None = None
-    maximum: int | float | None = None
     text_type: bool = False
     max_length: int | None = None
     permutations: int | str = 1
@@ -116,10 +113,7 @@ class Choice:
         if self.text_type:
             kind = f"string{or_null}" + ("" if self.max_length is None else f", at most {self.max_length} characters")
         elif self.numeric_type is not None:
-            # Plain decimals: json.dumps writes 1e-05, which the answer line forbids.
-            bounds = [f"{word} {Decimal(json.dumps(value)):f}" for word, value in
-                      (("minimum", self.minimum), ("maximum", self.maximum)) if value is not None]
-            kind = ", ".join([self.numeric_type + or_null, *bounds])
+            kind = self.numeric_type + or_null
         else:
             kind = "boolean" if self.syntax == "Bool" else "choice"
         lines.append(f"Type: {kind}")
@@ -140,6 +134,16 @@ class Choice:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class Generation:
+    """What generate() returns, as the HTTP API does: the typed answers, the
+    reasoning of each field that thought, and the tokens of the call."""
+
+    result: dict[str, Any]
+    thinking: dict[str, str]
+    usage: Usage
+
+
 class TypeLLMClient:
     """Compile ordered schemas into constrained single-token decisions."""
 
@@ -157,7 +161,6 @@ class TypeLLMClient:
         label_pool: Sequence[str] | None = None,
         numeric_max_digits: int = 32,
         tokenizer: str | None = None,
-        thinking_budget: int | None = None,
         text_max_tokens: int = 128,
     ) -> None:
         """temperature 0 (the default) picks the most likely answer; above 0
@@ -171,7 +174,6 @@ class TypeLLMClient:
             model,
             timeout,
             tokenizer=tokenizer,
-            thinking_budget=thinking_budget,
             text_max_tokens=text_max_tokens,
             answer_reserve_tokens=numeric_max_digits + 3,
         )
@@ -185,43 +187,20 @@ class TypeLLMClient:
         self._last_prompts: ContextVar[list[str]] = ContextVar(
             f"typellm_last_prompts_{id(self)}", default=[]
         )
-        self._last_usage: ContextVar[Usage | None] = ContextVar(
-            f"typellm_last_usage_{id(self)}", default=None
-        )
-        self._last_thinking: ContextVar[dict[str, str]] = ContextVar(
-            f"typellm_last_thinking_{id(self)}", default={}
-        )
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         del state["_last_prompts"]
-        del state["_last_usage"]
-        del state["_last_thinking"]
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._last_prompts = ContextVar(f"typellm_last_prompts_{id(self)}", default=[])
-        self._last_usage = ContextVar(f"typellm_last_usage_{id(self)}", default=None)
-        self._last_thinking = ContextVar(f"typellm_last_thinking_{id(self)}", default={})
 
     @property
     def last_prompts(self) -> list[str]:
         """Final prompts of the last generate() call made in this thread or task."""
         return self._last_prompts.get()
-
-    @property
-    def last_thinking(self) -> dict[str, str]:
-        """Reasoning of the fields that thought in the last call in this thread or task."""
-        return self._last_thinking.get()
-
-    @property
-    def last_usage(self) -> Usage | None:
-        """Requests and tokens of the last generate() call made in this thread or task.
-
-        Set even when the call raised, so partial work is still counted.
-        """
-        return self._last_usage.get()
 
     def _control_labels(self, count: int) -> list[str]:
         labels: list[str] = []
@@ -262,8 +241,6 @@ class TypeLLMClient:
                     name=item.name,
                     syntax=item.syntax,
                     numeric_type=item.numeric_type,
-                    minimum=item.minimum,
-                    maximum=item.maximum,
                     text_type=item.text_type,
                     max_length=item.max_length,
                     permutations=item.permutations,
@@ -367,8 +344,11 @@ class TypeLLMClient:
         timeout: float | None = None,
         cancel: threading.Event | None = None,
         print_final_prompt: bool = False,
-    ) -> dict[str, Any]:
+    ) -> Generation:
         """Answer every field; fields run in parallel unless they declare depends_on.
+
+        Returns the typed answers in .result, with .thinking and .usage. When a
+        local call fails, the exception's .usage holds the tokens it spent.
 
         A seed fixes this call's own random choices and leaves the client's shared
         stream alone; without one, calls share that stream. The server's numerics
@@ -377,8 +357,6 @@ class TypeLLMClient:
         raises GenerationTimeout; setting cancel raises GenerationCancelled.
         Both stop the call before its next request to SGLang.
         """
-        self._last_usage.set(None)
-        self._last_thinking.set({})
         if (context is None) == (state is None):
             raise ValueError("provide exactly one of context or state")
         context = state if state is not None else context
@@ -419,11 +397,12 @@ class TypeLLMClient:
                         active_temperature, rng, self.numeric_max_digits,
                         image_count=len(encoded_images),
                     )
-            finally:
-                self._last_usage.set(scope.usage)
+            except BaseException as exc:
+                exc.usage = scope.usage  # partial work, for callers that bill it
+                raise
         self._last_prompts.set(prompts)
-        self._last_thinking.set({decision.name: row["thinking"] for decision, row in zip(decisions, rows)
-                                 if row.get("thinking")})
+        thinking = {decision.name: row["thinking"] for decision, row in zip(decisions, rows)
+                    if row.get("thinking")}
 
         output: dict[str, Any] = {}
         for decision, row in zip(decisions, rows):
@@ -443,7 +422,7 @@ class TypeLLMClient:
 
         if print_final_prompt:
             _print_final_prompts(prompts)
-        return output
+        return Generation(output, thinking, scope.usage)
 
 
 def candidate_softmax(
@@ -522,16 +501,6 @@ def _parse_numeric_value(text: str, decision: Choice) -> int | float:
     )
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"Generated non-finite number for {decision.name!r}")
-    if decision.minimum is not None and value < decision.minimum:
-        raise ValueError(
-            f"Generated value {value} is below minimum {decision.minimum} "
-            f"for {decision.name!r}"
-        )
-    if decision.maximum is not None and value > decision.maximum:
-        raise ValueError(
-            f"Generated value {value} is above maximum {decision.maximum} "
-            f"for {decision.name!r}"
-        )
     return value
 
 
@@ -960,10 +929,9 @@ def run_schema(
     seed: int | None = None,
     numeric_max_digits: int = 32,
     tokenizer: str | None = None,
-    thinking_budget: int | None = None,
     text_max_tokens: int = 128,
     print_final_prompt: bool = False,
-) -> dict[str, Any]:
+) -> Generation:
     client = TypeLLMClient(
         base_url or os.environ.get("SGLANG_URL", "http://127.0.0.1:30000"),
         model or os.environ.get("SGLANG_MODEL"),
@@ -972,7 +940,6 @@ def run_schema(
         seed=seed,
         numeric_max_digits=numeric_max_digits,
         tokenizer=tokenizer,
-        thinking_budget=thinking_budget,
         text_max_tokens=text_max_tokens,
     )
     return client.generate(
