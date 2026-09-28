@@ -909,3 +909,29 @@ class JsonSchemaExecutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecodingTests(unittest.TestCase):
+    def test_temperature_alone_decides(self):
+        from typellm.runtime import _resolve_decoding
+
+        self.assertEqual(_resolve_decoding(None, None), ("argmax", 0.0))
+        self.assertEqual(_resolve_decoding(None, 0), ("argmax", 0.0))
+        self.assertEqual(_resolve_decoding(None, 0.7), ("sample", 0.7))
+        for bad in (-1, float("nan"), True, "1"):
+            with self.assertRaises(ValueError):
+                _resolve_decoding(None, bad)
+
+    def test_deprecated_mode_still_works(self):
+        from typellm.runtime import _resolve_decoding
+
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(_resolve_decoding("sample", None), ("sample", 1.0))
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(_resolve_decoding("argmax", 0.7)[0], "argmax")
+        with self.assertWarns(DeprecationWarning), self.assertRaises(ValueError):
+            _resolve_decoding("sample", 0)
+
+    def test_call_temperature_overrides_client(self):
+        client = TypeLLMClient(model="fake", temperature=0.7)
+        self.assertEqual((client.mode, client.temperature), ("sample", 0.7))

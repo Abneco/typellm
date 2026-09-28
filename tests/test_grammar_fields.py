@@ -87,7 +87,7 @@ class GrammarNumberTests(unittest.TestCase):
         self.assertIn("null", patterns[3])
 
     def test_sampling_passes_the_temperature_and_no_truncation(self):
-        client = TypeLLMClient(model="fake", mode="sample", temperature=0.7, seed=1)
+        client = TypeLLMClient(model="fake", temperature=0.7, seed=1)
         client.sglang = FakeServer()
         client.generate(context="Receipt", questions={"a": {"type": "integer"}})
         [params] = regex_requests(client.sglang)[0]["sampling_params"]

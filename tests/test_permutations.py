@@ -39,7 +39,7 @@ class PermutationTests(unittest.TestCase):
 
     def test_sampling_uses_averaged_distribution(self):
         with patch('typellm.runtime._sample', return_value='B') as sample:
-            _client, result = self.run_case(False, ['one', 'two', 'three'], mode='sample', temperature=.5)
+            _client, result = self.run_case(False, ['one', 'two', 'three'], temperature=.5)
         self.assertEqual(result['roll']['value'], 'two')
         self.assertEqual(sample.call_count, 2)  # one final choice plus the boolean
         for p in sample.call_args_list[0].args[0].values():

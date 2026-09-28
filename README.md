@@ -332,19 +332,20 @@ result = client.generate(
 Only opted-in fields return `value` and `probabilities`; other fields return plain values.
 The option is not supported on open Numeric or Text fields.
 
-Argmax is the default. To enable sampling:
+`temperature` is 0 by default: each field gets its most likely answer. Above 0,
+TypeLLM samples at that temperature:
 
 ```python
 client = TypeLLMClient(
     "http://127.0.0.1:30000",
-    mode="sample",
     temperature=0.8,
     seed=42,
 )
 ```
 
 Sampling applies to finite candidates for Choice fields and to token generation
-for Numeric and Text fields. `temperature` controls sampling in each case.
+for Numeric and Text fields. `generate(temperature=...)` sets it for one call.
+The older `mode="argmax"` / `mode="sample"` still works for now but is deprecated.
 
 A seed fixes TypeLLM's own random choices. SGLang's log probabilities can shift
 with its prefix cache and batching, so the same seed may still give different
