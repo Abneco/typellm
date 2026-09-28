@@ -25,7 +25,6 @@ class Decision:
     syntax: str = "Choice"
     numeric_type: str | None = None
     text_type: bool = False
-    max_length: int | None = None
     permutations: int | str = 1
     return_probabilities: bool = False
     depends_on: tuple[str, ...] | None = None
@@ -137,15 +136,16 @@ def compile_json_schema(schema: Mapping[str, Any]) -> list[Decision]:
             raise SchemaError(
                 f"x-other for {name!r} is not supported; use a closed enum"
             )
-        max_length = field.get("maxLength")
-        if "maxLength" in field and (type(max_length) is not int or max_length < 0):
-            raise SchemaError(f"maxLength for {name!r} must be a non-negative integer")
+        # Checking a length means decoding every token back to text, which slows every
+        # string; answers stop at the client's text_max_tokens instead.
+        if "maxLength" in field:
+            raise SchemaError(f"maxLength is not supported (on {name!r}); string answers stop at "
+                              "text_max_tokens, so ask for the length you want in instructions")
         if field_type == "string" and enum is None:
             for keyword in ("minLength", "pattern", "format"):
                 if keyword in field:
                     raise SchemaError(f"{keyword} is not supported for text fields")
-            decisions.append(Decision(name, question, (), "Text", text_type=True,
-                                      max_length=max_length, nullable=nullable))
+            decisions.append(Decision(name, question, (), "Text", text_type=True, nullable=nullable))
             continue
         if field_type == "boolean":
             values = ([True, False] + [None] * nullable) if enum is None else enum
@@ -191,8 +191,6 @@ def compile_json_schema(schema: Mapping[str, Any]) -> list[Decision]:
                 raise SchemaError(
                     f"enum values for {name!r} do not match type {field_type!r}"
                 )
-            if field_type == "string" and max_length is not None and any(len(v) > max_length for v in typed):
-                raise SchemaError(f"enum values for {name!r} exceed maxLength")
             syntax = "Choice"
         else:
             raise NotImplementedError(

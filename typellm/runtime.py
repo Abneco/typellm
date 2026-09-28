@@ -60,7 +60,6 @@ class Choice:
     syntax: str = "Choice"
     numeric_type: str | None = None
     text_type: bool = False
-    max_length: int | None = None
     permutations: int | str = 1
     return_probabilities: bool = False
     depends_on: tuple[str, ...] | None = None
@@ -73,8 +72,6 @@ class Choice:
             raise ValueError("Choice.choices must not be empty")
         if self.text_type and (self.choices or self.numeric_type is not None):
             raise ValueError("Text choices cannot have enum values or a numeric type")
-        if self.max_length is not None and (type(self.max_length) is not int or self.max_length < 0):
-            raise ValueError("max_length must be a non-negative integer")
         if self.numeric_type not in {None, "integer", "number"}:
             raise ValueError("numeric_type must be None, 'integer', or 'number'")
         if self.numeric_type is not None and self.choices:
@@ -115,7 +112,7 @@ class Choice:
         # <number> reads as "a number is required" and pulls absent values to 0.
         or_null = " or null" if self.nullable else ""
         if self.text_type:
-            kind = f"string{or_null}" + ("" if self.max_length is None else f", at most {self.max_length} characters")
+            kind = f"string{or_null}"
         elif self.numeric_type is not None:
             kind = self.numeric_type + or_null
         else:
@@ -204,7 +201,8 @@ class TypeLLMClient:
         self.label_pool = tuple(label_pool or self.DEFAULT_LABEL_POOL)
         self.numeric_max_digits = numeric_max_digits
         self.label_token_map: dict[str, int] = {}
-        # Per-thread/task, so concurrent generate() calls never see each other's prompts.
+        # The prompts of the last call, for tests; per thread or task, so concurrent
+        # generate() calls never see each other's. print_final_prompt shows them.
         self._last_prompts: ContextVar[list[str]] = ContextVar(
             f"typellm_last_prompts_{id(self)}", default=[]
         )
@@ -218,10 +216,6 @@ class TypeLLMClient:
         self.__dict__.update(state)
         self._last_prompts = ContextVar(f"typellm_last_prompts_{id(self)}", default=[])
 
-    @property
-    def last_prompts(self) -> list[str]:
-        """Final prompts of the last generate() call made in this thread or task."""
-        return self._last_prompts.get()
 
     def _control_labels(self, count: int) -> list[str]:
         labels: list[str] = []
@@ -265,7 +259,6 @@ class TypeLLMClient:
                     syntax=item.syntax,
                     numeric_type=item.numeric_type,
                     text_type=item.text_type,
-                    max_length=item.max_length,
                     permutations=item.permutations,
                     return_probabilities=item.return_probabilities,
                     depends_on=item.depends_on,
@@ -889,7 +882,6 @@ def _execute_batch_decisions(
             numeric_max_digits + 4,
             # From {"name": the model writes the string's first token, quote included.
             [prompt + decision.answer_prefill for _, decision, _, prompt in text_pending],
-            [decision.max_length for _, decision, _, _ in text_pending],
             temperature=0 if mode == "argmax" else temperature,
             number_seed=number_seed,
             text_seed=text_seed,
