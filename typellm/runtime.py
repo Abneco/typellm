@@ -515,7 +515,17 @@ class TypeLLMClient:
             thinking = data.get("thinking") or {}
             input_tokens = usage["input_tokens"]
             thinking_tokens = usage["thinking_tokens"]
-        except (ValueError, TypeError, KeyError) as exc:
+            # JSON keys are strings: key probabilities by each field's values again, as locally.
+            # The service writes booleans as JSON does and other values as str() does, so an
+            # enum holding both "None" and null gets one entry.
+            for name, question in questions.items():
+                answer = result.get(name)
+                if isinstance(answer, dict):  # a return_probabilities answer
+                    values = {json.dumps(value) if type(value) is bool else str(value): value
+                              for value in question.get("enum") or (True, False, None)}
+                    answer["probabilities"] = {values.get(key, key): probability
+                                               for key, probability in answer["probabilities"].items()}
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
             raise SGLangError("TypeLLM API returned an invalid response",
                               status=response.status_code) from exc
         return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens))
