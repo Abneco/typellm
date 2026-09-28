@@ -1088,7 +1088,7 @@ class HostedApiTests(unittest.TestCase):
                                      httpx.Response(503, headers={"Retry-After": "3600"}),
                                      httpx.ConnectError("connection refused"), ok, max_retries=3)
 
-        self.assertEqual(client.generate(context="x", questions={"a": {"type": "boolean"}}), {"a": True})
+        self.assertEqual(client.generate(context="x", questions={"a": {"type": "boolean"}}).result, {"a": True})
         # Every attempt sends the same call, seed included.
         self.assertEqual(len(sent), 4)
         self.assertEqual(len({request.content for request in sent}), 1)
