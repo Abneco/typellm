@@ -51,7 +51,7 @@ class RuntimeTests(unittest.TestCase):
         client.sglang = NullServer()
         result = client.generate(context="Receipt", questions={
             "tip": {"type": ["number", "null"]}, "count": {"type": "integer"},
-        })
+        }).result
         self.assertEqual(result, {"tip": None, "count": 7})
         self.assertIn("Return null only if there is no value.", client.last_prompts[0])
 
@@ -60,7 +60,7 @@ class RuntimeTests(unittest.TestCase):
         client.sglang = NullServer()
         result = client.generate(context="Receipt", questions={
             "note": {"type": ["string", "null"], "maxLength": 20}, "name": {"type": "string"},
-        })
+        }).result
         self.assertEqual(result, {"note": None, "name": "blue"})
         self.assertEqual(client.sglang.requests("score"), [])  # no separate null step
         # One request for both strings, from '{"note":' and '{"name":'; only the nullable one may be null.
@@ -78,7 +78,7 @@ class RuntimeTests(unittest.TestCase):
         client.sglang = FakeSGLang(selected_ids=[ord("C")])
         result = client.generate(context="Receipt", questions={
             "paid": {"type": ["boolean", "null"], "return_probabilities": True},
-        })
+        }).result
         self.assertIsNone(result["paid"]["value"])
         self.assertEqual(set(result["paid"]["probabilities"]), {True, False, None})
 
@@ -88,7 +88,7 @@ class RuntimeTests(unittest.TestCase):
         client.generate(context="Receipt", questions={
             "tip": {"type": ["number", "null"]},
             "tipped": {"type": "boolean", "depends_on": ["tip"]},
-        })
+        }).result
         self.assertIn('{"tip": null}', client.last_prompts[1])
 
 

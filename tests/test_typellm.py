@@ -164,7 +164,7 @@ class JsonSchemaCompilerTests(unittest.TestCase):
                         {"schema": {"properties": [{**field, "type": "bool", "name": "paid"}]}},
                     ]:
                         with self.assertRaisesRegex(SchemaError, "use instructions"):
-                            client.generate(context="Paid", **kwargs)
+                            client.generate(context="Paid", **kwargs).result
 
     def test_invalid_instructions_are_rejected(self):
         for value in [None, 1, True, [], {}]:
@@ -222,31 +222,25 @@ class JsonSchemaCompilerTests(unittest.TestCase):
         )
         self.assertEqual(decision.choices, (0.1, 0.5, 1.0))
 
-    def test_open_integer_and_number_compile_with_bounds(self):
+    def test_open_integer_and_number_compile(self):
         decisions = compile_json_schema(
             {
                 "type": "object",
-                "properties": {
-                    "count": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 100,
-                    },
-                    "ratio": {"type": "number", "minimum": -1.0},
-                },
+                "properties": {"count": {"type": "integer"}, "ratio": {"type": "number"}},
             }
         )
         self.assertEqual(decisions[0].numeric_type, "integer")
         self.assertEqual(decisions[0].syntax, "Integer")
         self.assertEqual(decisions[0].choices, ())
-        self.assertEqual((decisions[0].minimum, decisions[0].maximum), (0, 100))
         self.assertEqual(decisions[1].numeric_type, "number")
 
-    def test_open_numeric_rejects_invalid_bounds(self):
+    def test_numeric_bounds_are_not_supported(self):
+        # Decoding cannot guarantee a range, so bounds are refused rather than hinted.
         for field in (
-            {"type": "integer", "minimum": "zero"},
-            {"type": "number", "minimum": 2, "maximum": 1},
-            {"type": "number", "maximum": float("inf")},
+            {"type": "integer", "minimum": 0},
+            {"type": "number", "maximum": 1},
+            {"type": "number", "exclusiveMinimum": 0},
+            {"type": "integer", "enum": [1, 2], "exclusiveMaximum": 3},
         ):
             with self.subTest(field=field), self.assertRaises(SchemaError):
                 compile_json_schema(
@@ -255,11 +249,9 @@ class JsonSchemaCompilerTests(unittest.TestCase):
 
     def test_integers_beyond_float_range_are_valid_json_numbers(self):
         big = 10**400
-        [bounded, choice] = compile_json_schema({"type": "object", "properties": {
-            "bounded": {"type": "integer", "maximum": big},
+        [choice] = compile_json_schema({"type": "object", "properties": {
             "choice": {"type": "number", "enum": [big, 0.5]},
         }})
-        self.assertEqual(bounded.maximum, big)
         self.assertEqual(choice.choices, (big, 0.5))
 
     def test_x_score_is_rejected_in_favor_of_number_enum(self):
@@ -356,8 +348,8 @@ class QuestionsInterfaceTests(unittest.TestCase):
             clients = [TypeLLMClient(), TypeLLMClient()]
             for client in clients:
                 client.sglang = FakeSGLang([ord("A")])
-            a = clients[0].generate(state=text, questions=questions)
-            b = clients[1].generate(context=text, questions=questions)
+            a = clients[0].generate(state=text, questions=questions).result
+            b = clients[1].generate(context=text, questions=questions).result
             self.assertEqual(a, b)
             self.assertEqual(clients[0].last_prompts, clients[1].last_prompts)
 
@@ -369,7 +361,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
             client = TypeLLMClient()
             client.sglang = Mock()
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                client.generate(questions={"paid": {"type": "boolean"}}, **kwargs)
+                client.generate(questions={"paid": {"type": "boolean"}}, **kwargs).result
             self.assertEqual(client.sglang.mock_calls, [])
 
     def test_run_schema_supports_state_with_both_input_formats(self):
@@ -378,9 +370,9 @@ class QuestionsInterfaceTests(unittest.TestCase):
         questions = {"paid": {"type": "boolean"}}
         for kwargs in [{"questions": questions}, {"schema": {"type": "object", "properties": questions}}]:
             with patch("typellm.runtime.SGLangClient", return_value=FakeSGLang([ord("A")])):
-                self.assertEqual(run_schema(state="Paid", **kwargs), {"paid": True})
+                self.assertEqual(run_schema(state="Paid", **kwargs).result, {"paid": True})
         with self.assertRaises(ValueError):
-            run_schema("Paid", state="Paid", questions=questions)
+            run_schema("Paid", state="Paid", questions=questions).result
 
     def test_questions_match_schema(self):
         questions = {
@@ -390,8 +382,8 @@ class QuestionsInterfaceTests(unittest.TestCase):
         clients = [TypeLLMClient(), TypeLLMClient()]
         for client in clients:
             client.sglang = FakeSGLang([ord("B"), ord("A")])
-        new = clients[0].generate(context="Receipt", questions=questions)
-        old = clients[1].generate(context="Receipt", schema={"type": "object", "properties": questions})
+        new = clients[0].generate(context="Receipt", questions=questions).result
+        old = clients[1].generate(context="Receipt", schema={"type": "object", "properties": questions}).result
         self.assertEqual(new, {"expense": "travel", "paid": True})
         self.assertEqual(new, old)
         self.assertEqual(clients[0].last_prompts, clients[1].last_prompts)
@@ -402,7 +394,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
         result = client.generate(context="Seven", questions={
             "type": {"type": "integer", "instructions": "Extract the number."},
             "properties": {"type": "boolean", "instructions": "Is it seven?"},
-        })
+        }).result
         self.assertEqual(result, {"type": 7, "properties": True})
 
     def test_questions_invalid_inputs_fail_before_network(self):
@@ -410,16 +402,16 @@ class QuestionsInterfaceTests(unittest.TestCase):
                        {"questions": []}, {"questions": "bad"}, {"questions": {"x": None}}]:
             client = TypeLLMClient()
             with self.subTest(kwargs=kwargs), self.assertRaises(SchemaError):
-                client.generate(context="Context", **kwargs)
+                client.generate(context="Context", **kwargs).result
 
     def test_run_schema_keeps_positional_schema_and_accepts_questions(self):
         from unittest.mock import patch
         from typellm import run_schema
         questions = {"paid": {"type": "boolean"}}
         with patch("typellm.runtime.SGLangClient", return_value=FakeSGLang([ord("A")])):
-            new = run_schema("Context", questions=questions)
+            new = run_schema("Context", questions=questions).result
         with patch("typellm.runtime.SGLangClient", return_value=FakeSGLang([ord("A")])):
-            old = run_schema("Context", {"type": "object", "properties": questions})
+            old = run_schema("Context", {"type": "object", "properties": questions}).result
         self.assertEqual(new, old)
         self.assertEqual(new, {"paid": True})
 
@@ -441,8 +433,8 @@ class ThinkingTests(unittest.TestCase):
         self.assertLess(params["max_new_tokens"], 8192)
         self.assertEqual(params["stop"], ["</think>"])
         with patch("typellm.runtime.TypeLLMClient") as factory:
-            run_schema(context="x", questions={"flag": {"type": "boolean"}})
-            self.assertIsNone(factory.call_args.kwargs["thinking_budget"])
+            run_schema(context="x", questions={"flag": {"type": "boolean"}}).result
+            self.assertNotIn("thinking_budget", factory.call_args.kwargs)
 
     def make_client(self, response=None):
         from unittest.mock import Mock
@@ -522,7 +514,7 @@ class ThinkingTests(unittest.TestCase):
             client.sglang = fake
             self.assertEqual(client.generate(context="test", questions={
                 "n": {"type": "integer"}, "b": {"type": "boolean"}, "t": {"type": "string"},
-            }), {"n": 7, "b": True, "t": "blue"})
+            }).result, {"n": 7, "b": True, "t": "blue"})
             self.assertTrue(all(p.endswith('</think>\n\n{"n":') for p in fake.number_prefixes))
 
     def test_incomplete_or_empty_thinking_returns_no_answer(self):
@@ -554,12 +546,10 @@ class ThinkingTests(unittest.TestCase):
         self.assertFalse(client._chat_tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"])
 
     def test_public_configuration_and_validation(self):
-        client = TypeLLMClient(thinking_budget=256)
-        self.assertEqual(client.sglang.thinking_budget, 256)
-        with self.assertRaises(TypeError):
-            TypeLLMClient(thinking=True)  # thinking is chosen per field
-        for kwargs in [{"thinking_budget": 0}, {"thinking_budget": True}, {"thinking_budget": 1.5}]:
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+        # Thinking and its budget are chosen per field; without a budget, a field
+        # may reason until the context is full.
+        for kwargs in [{"thinking": True}, {"thinking_budget": 256}]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(TypeError):
                 TypeLLMClient(**kwargs)
 
 
@@ -632,7 +622,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             'Answer as {"score": "<label>"}.',
             compiled.opening_text(),
         )
-        result = client.generate(context="context", schema=schema)
+        result = client.generate(context="context", schema=schema).result
         self.assertEqual(result, {"score": 1.0})
 
     def test_semantic_result_and_prior_value_in_later_prompt(self):
@@ -653,7 +643,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         fake = DependencyFake([ord("B"), ord("A")])
         client.sglang = fake
 
-        result = client.generate(context="context", schema=schema)
+        result = client.generate(context="context", schema=schema).result
 
         self.assertEqual(result, {"scale": 0.5, "enabled": True})
         self.assertNotIn("A", result)
@@ -664,12 +654,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         schema = {
             "type": "object",
             "properties": {
-                "count": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 100,
-                    "instructions": "How many items?",
-                },
+                "count": {"type": "integer", "instructions": "How many items?"},
                 "enabled": {"type": "boolean"},
             },
         }
@@ -677,12 +662,12 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         fake = FakeSGLang([ord("A")], numbers=[" 42}"])
         client.sglang = fake
 
-        result = client.generate(context="context", schema=schema)
+        result = client.generate(context="context", schema=schema).result
 
         self.assertEqual(result, {"count": 42, "enabled": True})
         self.assertEqual(fake.number_patterns, [numeric_pattern("integer", 32)])
         self.assertIn(
-            'Type: integer, minimum 0, maximum 100\nInstructions: How many items?\nAnswer as {"count": <integer>}.',
+            'Type: integer\nInstructions: How many items?\nAnswer as {"count": <integer>}.',
             fake.number_prefixes[0],
         )
         self.assertTrue(fake.number_prefixes[0].endswith('<assistant>{"count":'))
@@ -697,7 +682,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         fake = FakeSGLang(numbers=[" -0.75"])  # ends at the end of the message
         client.sglang = fake
 
-        result = client.generate(context="context", schema=schema)
+        result = client.generate(context="context", schema=schema).result
 
         self.assertEqual(result, {"temperature": -0.75})
         self.assertIn(
@@ -706,25 +691,15 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         )
         self.assertIn('<assistant>{"temperature": -0.75}</assistant>', client.last_prompts[0])
 
-    def test_open_integer_beyond_float_range_preserves_value_and_bounds(self):
+    def test_open_integer_beyond_float_range_preserves_value(self):
         big = 10**400
         for value in (big, -big):
-            for bounds, error in (
-                ({"minimum": value, "maximum": value}, None),
-                ({"minimum": value + 1}, "below minimum"),
-                ({"maximum": value - 1}, "above maximum"),
-            ):
-                with self.subTest(value=value, bounds=bounds):
-                    client = TypeLLMClient(numeric_max_digits=401)
-                    client.sglang = FakeSGLang(numbers=[f" {value}}}"])
-                    questions = {"n": {"type": "integer", **bounds}}
-                    if error is not None:
-                        with self.assertRaisesRegex(ValueError, error):
-                            client.generate(context="context", questions=questions)
-                    else:
-                        result = client.generate(context="context", questions=questions)
-                        self.assertEqual(result, {"n": value})
-                        self.assertIs(type(result["n"]), int)
+            with self.subTest(value=value):
+                client = TypeLLMClient(numeric_max_digits=401)
+                client.sglang = FakeSGLang(numbers=[f" {value}}}"])
+                result = client.generate(context="context", questions={"n": {"type": "integer"}}).result
+                self.assertEqual(result, {"n": value})
+                self.assertIs(type(result["n"]), int)
 
     def test_open_number_still_rejects_float_overflow(self):
         for sign in ("", "-"):
@@ -732,7 +707,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
                 client = TypeLLMClient(numeric_max_digits=401)
                 client.sglang = FakeSGLang(numbers=[f" {sign}{10**400}}}"])
                 with self.assertRaisesRegex(ValueError, "non-finite number"):
-                    client.generate(context="context", questions={"n": {"type": "number"}})
+                    client.generate(context="context", questions={"n": {"type": "number"}}).result
 
     def test_text_prompt_keeps_non_ascii_field_names_readable(self):
         [compiled] = TypeLLMClient().compile_schema(
@@ -859,7 +834,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         fake = FakeSGLang([ord("A")])
         client.sglang = fake
 
-        result = client.generate(context="context", schema=schema)
+        result = client.generate(context="context", schema=schema).result
 
         self.assertEqual(result, {"count": 7, "enabled": True})
         self.assertIn('<assistant>{"count": 7}</assistant>', client.last_prompts[0])
@@ -884,7 +859,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         fake = FakeSGLang([ord("B"), ord("A")])
         client.sglang = fake
 
-        result = client.generate(context="context", schema=schema)
+        result = client.generate(context="context", schema=schema).result
 
         self.assertEqual(result, {"scale": 0.5, "enabled": True})
         self.assertEqual(fake.cached_prefixes, ["<user>context</user>"])
@@ -931,9 +906,9 @@ class HostedApiTests(unittest.TestCase):
         client = self.client(handler, seed=7)
         questions = {"total": {"type": "number", "thinking": True}}
         image = "data:image/png;base64,iVBORw0KGgo="
-        result = client.generate(context="Total: 12.50", questions=questions, images=[image], timeout=90)
+        done = client.generate(context="Total: 12.50", questions=questions, images=[image], timeout=90)
 
-        self.assertEqual(result, {"total": 12.5})
+        self.assertEqual(done.result, {"total": 12.5})
         [request] = seen
         self.assertEqual(str(request.url), "https://api.typellm.ai/v1/generate")
         self.assertEqual(request.headers["authorization"], "Bearer k")
@@ -942,8 +917,8 @@ class HostedApiTests(unittest.TestCase):
             # Each call draws its seed from the client's seeded stream.
             "options": {"mode": "argmax", "seed": random.Random(7).randrange(2**32)},
         })
-        self.assertEqual((client.last_usage.input_tokens, client.last_usage.thinking_tokens), (40, 9))
-        self.assertEqual(client.last_thinking, {"total": "The receipt says 12.50."})
+        self.assertEqual((done.usage.input_tokens, done.usage.thinking_tokens), (40, 9))
+        self.assertEqual(done.thinking, {"total": "The receipt says 12.50."})
 
     def test_hosted_temperature_only_applies_to_sampling(self):
         bodies = []
@@ -955,9 +930,9 @@ class HostedApiTests(unittest.TestCase):
             })
 
         self.client(handler, temperature=0).generate(
-            context="x", questions={"a": {"type": "boolean"}})
+            context="x", questions={"a": {"type": "boolean"}}).result
         self.client(handler, temperature=0.7).generate(
-            context="x", questions={"a": {"type": "boolean"}})
+            context="x", questions={"a": {"type": "boolean"}}).result
 
         self.assertNotIn("temperature", bodies[0]["options"])
         self.assertEqual(bodies[1]["options"]["temperature"], 0.7)
@@ -973,9 +948,9 @@ class HostedApiTests(unittest.TestCase):
 
         questions = {"a": {"type": "boolean"}}
         client = self.client(handler, timeout=240)
-        client.generate(context="x", questions=questions)
-        client.generate(context="x", questions=questions, timeout=30)
-        self.client(handler).generate(context="x", questions=questions)
+        client.generate(context="x", questions=questions).result
+        client.generate(context="x", questions=questions, timeout=30).result
+        self.client(handler).generate(context="x", questions=questions).result
 
         self.assertEqual([json.loads(request.content).get("timeout") for request in seen],
                          [240, 30, None])
@@ -990,20 +965,20 @@ class HostedApiTests(unittest.TestCase):
 
         for timeout in (0, -1, True, "5", float("nan")):
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
-                client.generate(context="x", questions=questions, timeout=timeout)
+                client.generate(context="x", questions=questions, timeout=timeout).result
         with self.assertRaises(ValueError):
             self.client(lambda request: sent.append(request), timeout=0).generate(
-                context="x", questions=questions)
+                context="x", questions=questions).result
         self.assertEqual(sent, [])
 
     def test_api_errors_keep_their_status(self):
         for status, error in ((401, SGLangError), (429, SGLangError), (504, GenerationTimeout)):
             client = self.client(lambda request: httpx.Response(status, json={"error": {"message": "no"}}))
             with self.assertRaises(error) as caught:
-                client.generate(context="x", questions={"a": {"type": "boolean"}})
+                client.generate(context="x", questions={"a": {"type": "boolean"}}).result
             self.assertEqual(caught.exception.status, status)
         with self.assertRaises(ValueError):  # only local compilation takes a raw schema
-            client.generate(context="x", schema={"type": "object", "properties": {"a": {"type": "boolean"}}})
+            client.generate(context="x", schema={"type": "object", "properties": {"a": {"type": "boolean"}}}).result
 
     def test_hosted_compile_schema_requires_own_server(self):
         client = TypeLLMClient(api_key="k")
@@ -1019,7 +994,7 @@ class HostedApiTests(unittest.TestCase):
             with self.subTest(status=response.status_code):
                 client._transport = httpx.MockTransport(lambda request: response)
                 with self.assertRaises(SGLangError) as caught:
-                    client.generate(context="x", questions=questions)
+                    client.generate(context="x", questions=questions).result
                 self.assertEqual(caught.exception.status, response.status_code)
 
 

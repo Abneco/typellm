@@ -57,8 +57,8 @@ def main():
         for thinking in ([False] if 'Ling-mini' in args.model else [False, True]):
             for name, context, questions, expected in [*small.cases(), *dag_cases()]:
                 client = TypeLLMClient(args.url, model=args.model, tokenizer=args.model,
-                    thinking_budget=args.thinking_budget, text_max_tokens=128,
-                    timeout=180, seed=42)
+                    text_max_tokens=128, timeout=180, seed=42)
+                client.sglang.thinking_budget = args.thinking_budget  # for every field that thinks
                 client.sglang._chat_tokenizer = tokenizer
                 client.sglang._numeric_tokens = numeric
                 original = client.sglang._request
@@ -74,7 +74,7 @@ def main():
                 row = {'model': args.model, 'case': name, 'thinking': thinking}
                 start = time.monotonic()
                 try:
-                    result = client.generate(context=context, questions={k: {**v, 'thinking': True} for k, v in questions.items()} if thinking else questions)
+                    result = client.generate(context=context, questions={k: {**v, 'thinking': True} for k, v in questions.items()} if thinking else questions).result
                     values = {k: v['value'] if questions[k].get('return_probabilities') else v for k,v in result.items()}
                     prompts = dict(zip(questions, client.last_prompts)) if name.startswith('dag_') else client.last_prompts
                     row.update(result=result, type_valid=small.validate(result, questions), correct=values == expected, prompts=prompts)
