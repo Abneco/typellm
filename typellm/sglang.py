@@ -155,6 +155,19 @@ def _closed_json_string(text: str) -> str:
     return json.loads('"' + text[:-1])
 
 
+def _partial_json_string(text: str) -> str:
+    """Decode a string cut off before its closing quote, dropping a split escape."""
+    text = _after_open_quote(text)
+    for cut in range(min(len(text), 6) + 1):
+        try:
+            value = json.loads('"' + text[:len(text) - cut] + '"')
+        except ValueError:
+            continue
+        # Cut between the two escapes of a surrogate pair: drop the half it wrote.
+        return value[:-1] if value and 0xD800 <= ord(value[-1]) <= 0xDBFF else value
+    raise ValueError(text)
+
+
 
 class SGLangClient:
     def __init__(
@@ -908,11 +921,16 @@ class SGLangClient:
                     raise SGLangError(f"Text generation did not complete normally: {finish!r}")
                 values.append(None)
                 continue
-            if kind != "stop":
+            # Running out of text_max_tokens mid-string cuts the string off there.
+            truncated = after_key and kind == "length"
+            if kind != "stop" and not truncated:
                 raise SGLangError(f"Text generation did not complete normally: {finish!r}")
             try:
                 text = item["text"]
-                value = _closed_json_string(text) if after_key else json.loads(text)
+                if truncated:
+                    value = _partial_json_string(text)
+                else:
+                    value = _closed_json_string(text) if after_key else json.loads(text)
             except (KeyError, TypeError, ValueError) as exc:
                 raise SGLangError("Text generation returned an invalid JSON string") from exc
             if not isinstance(value, str):
@@ -964,7 +982,8 @@ class SGLangClient:
         With after_key, every prompt ends with '{"name":', and the model writes the
         opening quote, the characters and the closing '"}'. Writing the quote
         itself lets it start with a merged token such as ' "$', which keeps the
-        first character. A string stops at text_max_tokens.
+        first character. A string stops at text_max_tokens: one that runs out is
+        cut off there.
         """
         nullable = self._check_nullable(nullable, prefixes)
         if not prefixes:
