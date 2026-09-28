@@ -1,6 +1,7 @@
 import json
 import random
 import unittest
+from unittest import mock
 
 import httpx
 
@@ -892,10 +893,29 @@ class JsonSchemaExecutionTests(unittest.TestCase):
 
 
 class HostedApiTests(unittest.TestCase):
+    def setUp(self):
+        # Retries wait through time.sleep; record the waits instead.
+        patcher = mock.patch("typellm.runtime.time.sleep")
+        self.sleeps = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def client(self, handler, **options):
         client = TypeLLMClient(api_key="k", **options)
         client._transport = httpx.MockTransport(handler)
         return client
+
+    def replying(self, *replies, **options):
+        """A client whose requests get these replies in turn: a status, a response or an error."""
+        sent = []
+
+        def handler(request):
+            sent.append(request)
+            reply = replies[len(sent) - 1]
+            if isinstance(reply, Exception):
+                raise reply
+            return httpx.Response(reply) if isinstance(reply, int) else reply
+
+        return self.client(handler, **options), sent
 
     def test_a_call_is_one_request_to_the_hosted_api(self):
         seen = []
@@ -1061,6 +1081,41 @@ class HostedApiTests(unittest.TestCase):
                 with self.assertRaises(SGLangError) as caught:
                     client.generate(context="x", questions=questions).result
                 self.assertEqual(caught.exception.status, response.status_code)
+
+    def test_hosted_retries_rate_limits_server_errors_and_connection_errors(self):
+        ok = httpx.Response(200, json={"result": {"a": True}, "usage": {"input_tokens": 1, "thinking_tokens": 0}})
+        client, sent = self.replying(httpx.Response(429, headers={"Retry-After": "1"}),
+                                     httpx.Response(503, headers={"Retry-After": "3600"}),
+                                     httpx.ConnectError("connection refused"), ok, max_retries=3)
+
+        self.assertEqual(client.generate(context="x", questions={"a": {"type": "boolean"}}).result, {"a": True})
+        # Every attempt sends the same call, seed included.
+        self.assertEqual(len(sent), 4)
+        self.assertEqual(len({request.content for request in sent}), 1)
+        # The service's Retry-After when it is at most a minute, else backoff: 1 s, then 2 s,
+        # less up to 25% jitter.
+        first, second, third = (call.args[0] for call in self.sleeps.call_args_list)
+        self.assertEqual(first, 1.0)
+        self.assertTrue(0.75 <= second <= 1.0, second)
+        self.assertTrue(1.5 <= third <= 2.0, third)
+
+    def test_hosted_retries_stop_at_max_retries_and_never_repeat_a_timeout(self):
+        for replies, options, error in (
+            ((503, 503, 503), {}, SGLangError),  # two retries by default
+            ((httpx.ConnectError("connection refused"),) * 3, {}, SGLangError),
+            ((503,), {"max_retries": 0}, SGLangError),
+            ((504,), {}, GenerationTimeout),  # the call has had its time
+            ((httpx.ReadTimeout("no answer"),), {}, SGLangError),  # so has this one
+            ((400,), {}, SGLangError),
+        ):
+            with self.subTest(replies=replies, **options):
+                client, sent = self.replying(*replies, **options)
+                with self.assertRaises(error):
+                    client.generate(context="x", questions={"a": {"type": "boolean"}})
+                self.assertEqual(len(sent), len(replies))
+        for max_retries in (-1, True):
+            with self.subTest(max_retries=max_retries), self.assertRaises(ValueError):
+                TypeLLMClient(api_key="k", max_retries=max_retries)
 
 
 if __name__ == "__main__":

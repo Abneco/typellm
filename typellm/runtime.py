@@ -8,6 +8,7 @@ import math
 import os
 import random
 import threading
+import time
 import warnings
 from contextlib import nullcontext
 from contextvars import ContextVar
@@ -160,6 +161,7 @@ class TypeLLMClient:
         temperature: float | None = None,
         seed: int | None = None,
         timeout: float | None = None,
+        max_retries: int = 2,
         label_pool: Sequence[str] | None = None,
         numeric_max_digits: int = 32,
         tokenizer: str | None = None,
@@ -183,6 +185,9 @@ class TypeLLMClient:
 
         temperature 0 (the default) picks the most likely answer; above 0 samples
         at that temperature. mode is deprecated: temperature alone decides.
+
+        A hosted call that gets HTTP 429, a 5xx other than 504 or a connection
+        error is retried up to max_retries times.
         """
         mode, temperature = _resolve_decoding(mode, temperature)
         if type(numeric_max_digits) is not int or numeric_max_digits <= 0:
@@ -193,6 +198,8 @@ class TypeLLMClient:
                 raise ValueError("api_key is empty")
         elif base_url is None:
             api_key = os.environ.get("TYPELLM_API_KEY", "").strip() or None
+        if type(max_retries) is not int or max_retries < 0:
+            raise ValueError("max_retries must be a non-negative integer")
         self.api_key = api_key
         if api_key is None:
             self.sglang = SGLangClient(
@@ -216,6 +223,7 @@ class TypeLLMClient:
             self.base_url = (base_url or HOSTED_URL).rstrip("/")
             self.model = model
             self.timeout = timeout
+            self.max_retries = max_retries
             self._transport: httpx.BaseTransport | None = None  # tests put a MockTransport here
         self.mode = mode
         self.temperature = temperature
@@ -472,7 +480,7 @@ class TypeLLMClient:
     def _generate_hosted(self, context: str, questions: Mapping[str, Any], images: Sequence[str],
                          mode: str, temperature: float, seed: int | None,
                          timeout: float | None) -> Generation:
-        """One POST /v1/generate. HTTP errors carry their status in SGLangError."""
+        """Run the call on the hosted API. HTTP errors carry their status in SGLangError."""
         active_timeout = self.timeout if timeout is None else timeout
         if active_timeout is not None and (type(active_timeout) not in (int, float) or
                                            not active_timeout > 0):
@@ -494,16 +502,10 @@ class TypeLLMClient:
             body["model"] = self.model
         if active_timeout is not None:
             body["timeout"] = active_timeout  # the service's own default (60 s) otherwise
-        try:
-            with httpx.Client(transport=self._transport) as http:
-                # The service times the call itself. The margin covers its queue, image
-                # scaling and the grace it gives its own workers past the timeout.
-                response = http.post(self.base_url + "/v1/generate", json=body,
-                                     headers={"Authorization": f"Bearer {self.api_key}"},
-                                     timeout=(active_timeout if active_timeout is not None
-                                              else DEFAULT_SOCKET_TIMEOUT) + 60)
-        except httpx.HTTPError as exc:
-            raise SGLangError(f"Could not reach the TypeLLM API at {self.base_url}: {exc!r}") from exc
+        # The service times the call itself. The margin covers its queue, image
+        # scaling and the grace it gives its own workers past the timeout.
+        response = self._post_hosted(body, (active_timeout if active_timeout is not None
+                                            else DEFAULT_SOCKET_TIMEOUT) + 60)
         if response.status_code != 200:
             error = GenerationTimeout if response.status_code == 504 else SGLangError
             raise error(f"TypeLLM API returned HTTP {response.status_code}: {response.text}",
@@ -529,6 +531,37 @@ class TypeLLMClient:
             raise SGLangError("TypeLLM API returned an invalid response",
                               status=response.status_code) from exc
         return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens))
+
+    def _post_hosted(self, body: dict[str, Any], timeout: float) -> httpx.Response:
+        """POST /v1/generate, retrying a 429, a 5xx other than 504 or a connection error.
+
+        A timeout, the socket's or the service's 504, is final: the call has had its time.
+        """
+        attempt = 0
+        with httpx.Client(transport=self._transport) as http:
+            while True:
+                try:
+                    response = http.post(self.base_url + "/v1/generate", json=body, timeout=timeout,
+                                         headers={"Authorization": f"Bearer {self.api_key}"})
+                except httpx.HTTPError as exc:
+                    if attempt == self.max_retries or isinstance(exc, httpx.TimeoutException):
+                        raise SGLangError(
+                            f"Could not reach the TypeLLM API at {self.base_url}: {exc!r}") from exc
+                    problem, retry_after = repr(exc), None
+                else:
+                    status = response.status_code
+                    if attempt == self.max_retries or not (status == 429 or (status >= 500 and status != 504)):
+                        return response
+                    problem, retry_after = f"HTTP {status}", response.headers.get("Retry-After")
+                try:  # the service's Retry-After, up to a minute
+                    delay = float(retry_after or 0)
+                except ValueError:
+                    delay = 0.0
+                if not 0 < delay <= 60:  # else 0.5 s, 1 s, 2 s ... 8 s, less up to 25% jitter
+                    delay = 0.5 * 2 ** min(attempt, 4) * (1 - 0.25 * random.random())
+                LOG.info("TypeLLM API call failed (%s); retrying in %.2f s", problem, delay)
+                time.sleep(delay)
+                attempt += 1
 
 
 def candidate_softmax(
