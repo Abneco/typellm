@@ -74,12 +74,14 @@ class StringConstraintTests(unittest.TestCase):
         client._request = text_reply(' "say \\"hi\\""}')
         self.assertEqual(client.generate_texts(['{"a":'], after_key=True), ['say "hi"'])
 
-    def test_an_unfinished_string_fails(self):
-        from typellm import SGLangError
+    def test_running_out_of_tokens_cuts_the_string_off(self):
+        # A string stops at text_max_tokens: the text written by then is its value.
         client = FakeServer()
-        client._request = text_reply("Edamame and", finish="length")
-        with self.assertRaisesRegex(SGLangError, "did not complete normally"):
-            client.generate_texts(['{"a":'], after_key=True)
+        for text, value in [(' "Edamame and', "Edamame and"),
+                            (' "tab\\', "tab"),  # cut inside an escape
+                            (' "smile \\ud83d\\ude', "smile ")]:  # cut inside a surrogate pair
+            client._request = text_reply(text, finish="length")
+            self.assertEqual(client.generate_texts(['{"a":'], after_key=True), [value])
 
 
 if __name__ == "__main__":
