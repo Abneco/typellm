@@ -51,8 +51,9 @@ def main() -> None:
         default=os.environ.get("TYPELLM_TOKENIZER"),
         help="Tokenizer path or Hugging Face ID; normally discovered from SGLang",
     )
-    parser.add_argument("--mode", choices=("argmax", "sample"), default="argmax")
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="0 picks the most likely answer; above 0 samples")
+    parser.add_argument("--mode", choices=("argmax", "sample"), help="deprecated; use --temperature")
     parser.add_argument("--numeric-max-digits", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--probabilities", action="store_true")

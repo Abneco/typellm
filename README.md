@@ -64,8 +64,8 @@ client = TypeLLMClient(api_key="YOUR_API_KEY")  # calls https://api.typellm.ai
 
 `generate()` then works as in the example below, with these differences:
 
-- The service compiles and runs the schema. Use `model`, `mode`, `temperature`
-  (for sampling), `seed` and `timeout`; local compilation settings do not apply.
+- The service compiles and runs the schema. Use `model`, `temperature`, `seed`
+  and `timeout`; local compilation settings do not apply.
   A call runs for at most 300 seconds, 60 by default. Set `timeout` on the
   client for a new default, or on `generate()` to override it for one call.
 - Pass `questions`; `schema=`, `cancel` and `print_final_prompt` need your
@@ -362,19 +362,20 @@ result = client.generate(
 Only opted-in fields return `value` and `probabilities`; other fields return plain values.
 The option is not supported on open Numeric or Text fields.
 
-Argmax is the default. To enable sampling:
+`temperature` is 0 by default: each field gets its most likely answer. Above 0,
+TypeLLM samples at that temperature:
 
 ```python
 client = TypeLLMClient(
     "http://127.0.0.1:30000",
-    mode="sample",
     temperature=0.8,
     seed=42,
 )
 ```
 
 Sampling applies to finite candidates for Choice fields and to token generation
-for Numeric and Text fields. `temperature` controls sampling in each case.
+for Numeric and Text fields. `generate(temperature=...)` sets it for one call.
+The older `mode="argmax"` / `mode="sample"` still works for now but is deprecated.
 
 A seed fixes TypeLLM's own random choices. SGLang's log probabilities can shift
 with its prefix cache and batching, so the same seed may still give different

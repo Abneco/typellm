@@ -8,6 +8,7 @@ import math
 import os
 import random
 import threading
+import warnings
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -154,8 +155,8 @@ class TypeLLMClient:
         model: str | None = None,
         *,
         api_key: str | None = None,
-        mode: str = "argmax",
-        temperature: float = 1.0,
+        mode: str | None = None,
+        temperature: float | None = None,
         seed: int | None = None,
         timeout: float | None = None,
         label_pool: Sequence[str] | None = None,
@@ -168,11 +169,14 @@ class TypeLLMClient:
 
         With api_key, calls go to the hosted API instead, by default
         https://api.typellm.ai. It compiles and runs the schema itself. Model
-        chooses one of its models; mode, temperature, seed and timeout apply.
+        chooses one of its models; temperature, seed and timeout apply.
         A hosted timeout set here is the default for generate() calls; without
         one, the service uses its own default.
+
+        temperature 0 (the default) picks the most likely answer; above 0 samples
+        at that temperature. mode is deprecated: temperature alone decides.
         """
-        _validate_decoding(mode, temperature)
+        mode, temperature = _resolve_decoding(mode, temperature)
         if type(numeric_max_digits) is not int or numeric_max_digits <= 0:
             raise ValueError("numeric_max_digits must be a positive integer")
         self.api_key = api_key
@@ -412,9 +416,13 @@ class TypeLLMClient:
             if not isinstance(questions, Mapping):
                 raise SchemaError("questions must be a mapping of field names to definitions")
             schema = {"type": "object", "properties": questions}
-        active_mode = self.mode if mode is None else mode
-        active_temperature = self.temperature if temperature is None else temperature
-        _validate_decoding(active_mode, active_temperature)
+        if mode is None and temperature is None:
+            active_mode, active_temperature = self.mode, self.temperature
+        else:
+            # A call's own temperature decides for it, whatever the client's mode.
+            if temperature is None:
+                temperature = self.temperature or None
+            active_mode, active_temperature = _resolve_decoding(mode, temperature)
         if self.api_key is not None:
             if questions is None or cancel is not None or print_final_prompt:
                 raise ValueError("with api_key, generate() takes questions; schema, cancel and "
@@ -546,11 +554,30 @@ def _sample(probs: Mapping[str, float], rng: random.Random) -> str:
     return last
 
 
-def _validate_decoding(mode: str, temperature: float) -> None:
-    if mode not in {"argmax", "sample"}:
-        raise ValueError("mode must be 'argmax' or 'sample'")
-    if mode == "sample" and (not math.isfinite(temperature) or temperature <= 0):
-        raise ValueError("temperature must be finite and > 0 in sample mode")
+def _resolve_decoding(mode: str | None, temperature: float | None) -> tuple[str, float]:
+    """The (mode, temperature) that temperature, and the deprecated mode, ask for.
+
+    temperature 0 picks the most likely answer (argmax); above 0 samples. For
+    older code, mode="sample" without a temperature samples at 1.0 and
+    mode="argmax" is argmax whatever the temperature.
+    """
+    if mode is not None:
+        warnings.warn("mode is deprecated; temperature 0 picks the most likely answer and "
+                      "above 0 samples", DeprecationWarning, stacklevel=3)
+        if mode not in {"argmax", "sample"}:
+            raise ValueError("mode must be 'argmax' or 'sample'")
+        if mode == "sample" and temperature is None:
+            temperature = 1.0
+    if temperature is None:
+        temperature = 0.0
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            or not math.isfinite(temperature) or temperature < 0):
+        raise ValueError("temperature must be a finite number >= 0")
+    if mode == "argmax":
+        return "argmax", float(temperature)
+    if mode == "sample" and temperature == 0:
+        raise ValueError("temperature must be > 0 in sample mode")
+    return ("sample" if temperature > 0 else "argmax"), float(temperature)
 
 
 def _numeric_text_is_complete(text: str, numeric_type: str) -> bool:
@@ -1006,8 +1033,8 @@ def _print_final_prompts(prefixes: Sequence[str]) -> None:
 def run_schema(
     context: str | None = None,
     schema: Mapping[str, Any] | None = None,
-    mode: str = "argmax",
-    temperature: float = 1.0,
+    mode: str | None = None,
+    temperature: float | None = None,
     *,
     state: str | None = None,
     questions: Mapping[str, Any] | None = None,
