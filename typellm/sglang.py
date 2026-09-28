@@ -24,7 +24,9 @@ def _overrides(thinking: bool | None, budget: int | None) -> tuple:
 class SGLangError(RuntimeError):
     def __init__(self, message: str = "", *, status: int | None = None) -> None:
         super().__init__(message)
-        self.status = status  # The HTTP status SGLang answered with, if any.
+        # The HTTP status SGLang (or the hosted API) answered with, if any. 400 also
+        # marks an input TypeLLM finds too long before sending it, as SGLang would.
+        self.status = status
 
 
 class GenerationTimeout(SGLangError):
@@ -679,7 +681,8 @@ class SGLangClient:
         # This is available context, not an independent default thinking budget.
         available = self._context_length() - prefix_tokens - self.answer_reserve_tokens - closing_tokens - 16
         if available <= 0:
-            raise SGLangError("Input leaves no room for thinking and the final constrained answer")
+            raise SGLangError("Input leaves no room for thinking and the final constrained answer",
+                              status=400)
         budget = self.thinking_budget if budget is None else budget
         limit = available if budget is None else min(available, budget)
         return {

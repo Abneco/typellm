@@ -478,8 +478,9 @@ class ThinkingTests(unittest.TestCase):
         self.assertGreater(params["max_new_tokens"], 0)
         self.assertLess(params["max_new_tokens"] + len(prefix) + client.answer_reserve_tokens, 700)
         client._request.reset_mock()
-        with self.assertRaisesRegex(SGLangError, "no room"):
+        with self.assertRaisesRegex(SGLangError, "no room") as caught:
             client._finish_thinking("x" * 700 + "<think>")
+        self.assertEqual(caught.exception.status, 400)  # as SGLang answers an input too long
         client._request.assert_not_called()
 
     def test_context_discovery_and_caching(self):
