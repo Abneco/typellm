@@ -917,8 +917,9 @@ class SGLangClient:
                     raise SGLangError(f"Text generation did not complete normally: {finish!r}")
                 values.append(None)
                 continue
-            # With a max length, running out of tokens mid-string is a truncation.
-            truncated = after_key and limit is not None and kind == "length"
+            # Running out of tokens mid-string is a truncation, whether text_max_tokens or
+            # a max length set the budget.
+            truncated = after_key and kind == "length"
             if kind != "stop" and not truncated:
                 raise SGLangError(f"Text generation did not complete normally: {finish!r}")
             try:
@@ -989,7 +990,8 @@ class SGLangClient:
         itself lets it start with a merged token such as ' "$', which keeps the
         first character. A max length then truncates: generation is capped near
         that many tokens and the string is cut to that many characters, as a
-        length-bounded grammar would.
+        length-bounded grammar would. Without one, a string that runs out of
+        text_max_tokens is cut there.
         """
         nullable = self._check_lengths(nullable, prefixes, max_lengths)
         if not prefixes:

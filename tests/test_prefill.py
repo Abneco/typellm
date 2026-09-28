@@ -88,12 +88,11 @@ class StringConstraintTests(unittest.TestCase):
         client._request = text_reply(' "\u5bff\u53f8\u5bff', finish="length")
         self.assertEqual(client.generate_texts(['{"a":'], [2], after_key=True), ["寿司"])
 
-    def test_without_max_length_an_unfinished_string_still_fails(self):
-        from typellm import SGLangError
+    def test_without_max_length_running_out_of_tokens_truncates_too(self):
+        # text_max_tokens ran out: free text stops there instead of failing the call.
         client = FakeServer()
-        client._request = text_reply("Edamame and", finish="length")
-        with self.assertRaisesRegex(SGLangError, "did not complete normally"):
-            client.generate_texts(['{"a":'], [None], after_key=True)
+        client._request = text_reply(' "Edamame and', finish="length")
+        self.assertEqual(client.generate_texts(['{"a":'], [None], after_key=True), ["Edamame and"])
 
 
 if __name__ == "__main__":
