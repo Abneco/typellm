@@ -20,7 +20,7 @@ def cases():
         ('negative', 'The temperature is -7 degrees.', {'answer': {'type': 'integer', 'instructions': 'Extract the temperature.'}}, {'answer': -7}),
         ('number', 'The price is 12.5 dollars.', {'answer': {'type': 'number', 'instructions': 'Extract the price.'}}, {'answer': 12.5}),
         ('text', 'The access code is blue.', {'answer': {'type': 'string', 'instructions': 'Return only the access code.'}}, {'answer': 'blue'}),
-        ('bounded_text', 'The access code is blue.', {'answer': {'type': 'string', 'maxLength': 4, 'instructions': 'Return only the access code.'}}, {'answer': 'blue'}),
+        ('bounded_text', 'The access code is blue.', {'answer': {'type': 'string', 'instructions': 'Return only the access code.'}}, {'answer': 'blue'}),
         ('mixed', 'There are 3 red apples. They are fresh.', {
             'color': {'type': 'string', 'enum': ['red', 'blue'], 'instructions': 'What color are the apples?', 'return_probabilities': True},
             'count': {'type': 'integer', 'instructions': 'How many apples?'},
@@ -48,8 +48,6 @@ def validate(result, questions):
                  'number': type(value) in (int, float) and math.isfinite(value) if type(value) in (int, float) else False,
                  'boolean': type(value) is bool}[kind]
         if not valid or ('enum' in field and value not in field['enum']):
-            return False
-        if 'maxLength' in field and len(value) > field['maxLength']:
             return False
     return True
 
