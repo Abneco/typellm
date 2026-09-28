@@ -70,7 +70,7 @@ class GrammarNumberTests(unittest.TestCase):
         self.assertEqual(width(numbers), 3)
         self.assertTrue(all(t.endswith('":') for t in numbers["text"]))
         self.assertEqual(numbers["sampling_params"][0]["temperature"], 0)
-        self.assertIn('{"a": 7}', client.last_prompts[0])
+        self.assertIn('{"a": 7}', client._last_prompts.get()[0])
 
     def test_numbers_and_strings_of_a_layer_share_one_request(self):
         client = TypeLLMClient(model="fake")
@@ -99,7 +99,7 @@ class GrammarNumberTests(unittest.TestCase):
         result = client.generate(context="Receipt", questions={"tip": {"type": ["number", "null"]}}).result
         self.assertEqual(result, {"tip": None})
         self.assertEqual(client.sglang.requests("score"), [])
-        self.assertIn('{"tip": null}', client.last_prompts[0])
+        self.assertIn('{"tip": null}', client._last_prompts.get()[0])
 
     def test_an_incomplete_or_cut_off_number_is_an_error(self):
         for reply, finish, error in ((" 3.}", "stop", ValueError), (" 12", "length", SGLangError)):

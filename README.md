@@ -147,21 +147,22 @@ Enum choices support `string`, `integer`, and `number` types, with at most 24 va
 A string without `enum` generates free text:
 
 ```python
-result = client.generate(
+response = client.generate(
     context="The train ticket is for a client meeting.",
     questions={
         "summary": {"type": "string", "instructions": "Summarize in one sentence."},
     },
-).result
+)
 ```
 
 Free text stops after 128 tokens. Pass `text_max_tokens=` to the client for
-longer answers, or set `maxLength` on a field to cap its characters.
+longer answers, and ask for the length you want in the field's instructions.
+`maxLength` is not supported.
 
 Ask for a numeric answer without enumerating every possible value:
 
 ```python
-result = client.generate(
+response = client.generate(
     context="Calculate the requested value accurately.",
     questions={
         "answer": {
@@ -169,9 +170,9 @@ result = client.generate(
             "instructions": "What is 17.5 multiplied by 4?",
         },
     },
-).result
+)
 
-print(result)
+print(response.result)
 # {"answer": 70.0}
 ```
 
@@ -197,7 +198,7 @@ Add `"null"` to the type to allow a missing value. The field returns `None`
 when the input has no value for it:
 
 ```python
-result = client.generate(
+response = client.generate(
     context="Read the attached receipt.",
     images=["receipt.jpg"],
     questions={
@@ -207,7 +208,7 @@ result = client.generate(
         "card": {"type": ["string", "null"], "enum": ["VISA", "MASTERCARD", None],
                  "instructions": "Card network, if paid by card."},
     },
-).result
+)
 # {"tip": None, "table": "7A", "paid_in_cash": False, "card": None}
 ```
 
@@ -247,14 +248,14 @@ Pass images with `images=` alongside the text context. The served model must be
 a vision-language model, such as `Qwen/Qwen3.8-27B`.
 
 ```python
-result = client.generate(
+response = client.generate(
     context="The customer says this receipt was charged twice.",
     images=["receipt.png"],
     questions={
         "total": {"type": "number", "instructions": "What is the receipt total?"},
         "paid": {"type": "boolean", "instructions": "Is the receipt marked as paid?"},
     },
-).result
+)
 ```
 
 Each image can be a local file path, an http(s) URL, a `data:` URI, raw bytes,
@@ -267,7 +268,7 @@ Fields run together by default, and each sees only the original context.
 When a field needs earlier results, list them in `depends_on`:
 
 ```python
-result = client.generate(
+response = client.generate(
     context="The payments service is returning errors after a deployment.",
     questions={
         "system": {
@@ -292,7 +293,7 @@ result = client.generate(
             "depends_on": ["severity", "deployment_related"],
         },
     },
-).result
+)
 ```
 
 This runs `system`, then `severity` and `deployment_related`, then `rollback`.
@@ -305,7 +306,7 @@ step reuses its parent's cached prompt. Unknown names and cycles raise
 Set `return_probabilities` on individual enum or boolean fields:
 
 ```python
-result = client.generate(
+response = client.generate(
     context=context,
     questions={
         "expense_type": {
@@ -314,7 +315,7 @@ result = client.generate(
             "return_probabilities": True,
         },
     },
-).result
+)
 ```
 
 ```python
@@ -357,12 +358,12 @@ For a one-off request, use the convenience function:
 ```python
 from typellm import run_schema
 
-result = run_schema(
+response = run_schema(
     context=context,
     questions=questions,
     base_url="http://127.0.0.1:30000",
     model="Qwen/Qwen3.8-27B",
-).result
+)
 ```
 
 ### Per-question permutation averaging
@@ -370,7 +371,7 @@ result = run_schema(
 Add `permutations` to an `enum` question to reduce option-order bias. TypeLLM averages the probabilities and keeps the same return format.
 
 ```python
-result = client.generate(
+response = client.generate(
     context="A single roll of a fair die.",
     questions={"roll": {
         "type": "string",
@@ -379,7 +380,7 @@ result = client.generate(
         "permutations": "auto",
         "return_probabilities": True,
     }},
-).result
+)
 ```
 
 - `"auto"` evaluates a balanced set of orderings: each option takes every position,
@@ -411,7 +412,7 @@ response = client.generate(
     cancel=cancel,   # set it from another thread; raises GenerationCancelled
 )
 print(response.usage)
-# Usage(requests=4, prompt_tokens=1830, cached_tokens=1504, completion_tokens=7, thinking_tokens=0, input_tokens=410)
+# Usage(input_tokens=410, thinking_tokens=0, requests=4, prompt_tokens=1830, cached_tokens=1504, completion_tokens=7)
 ```
 
 `usage` reports the tokens of the call. When a call fails partway, the
@@ -454,8 +455,9 @@ Other sizes in the Qwen3.5 and Qwen3.8 families are expected to be compatible.
 
 [Image input](#image-input) has been tested with `Qwen/Qwen3.8-27B`.
 
-Use the checkpoint ID as `model=`. If the server's tokenizer path is unavailable
-locally, set `tokenizer=` to its matching Hugging Face ID or local directory.
+Use the checkpoint ID as `model=`. TypeLLM loads the tokenizer from the server's
+paths, then its served model name; if none of those loads locally, set
+`tokenizer=` to the matching Hugging Face ID or local directory.
 The tokenizer must load from standard artifacts without custom model code.
 
 ## Comparison with Jev-style models

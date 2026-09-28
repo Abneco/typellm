@@ -173,7 +173,7 @@ def features():
 
     def run(case):
         done = shared.generate(context=context_for(case), questions=questions)
-        return case, done.result, shared.last_prompts, done.usage
+        return case, done.result, shared._last_prompts.get(), done.usage
 
     wrong, leaked, usage_mismatch = [], [], []
     start = time.perf_counter()

@@ -63,10 +63,10 @@ class FakeSGLang:
         self.number_patterns.extend(patterns)
         return [next(self.numbers, " 7}") for _ in prefixes]
 
-    def generate_fields(self, number_prefixes, patterns, number_max_tokens, text_prefixes, max_lengths,
+    def generate_fields(self, number_prefixes, patterns, number_max_tokens, text_prefixes,
                         *, temperature=0, number_seed=0, text_seed=0, after_key=False, nullable=None):
         numbers = self.generate_numbers(number_prefixes, patterns, number_max_tokens)
-        texts = self.generate_texts(text_prefixes, max_lengths) if text_prefixes else []
+        texts = self.generate_texts(text_prefixes) if text_prefixes else []
         return numbers, texts
 
     def score_candidates(self, prefix, candidate_ids):
@@ -351,7 +351,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
             a = clients[0].generate(state=text, questions=questions).result
             b = clients[1].generate(context=text, questions=questions).result
             self.assertEqual(a, b)
-            self.assertEqual(clients[0].last_prompts, clients[1].last_prompts)
+            self.assertEqual(clients[0]._last_prompts.get(), clients[1]._last_prompts.get())
 
     def test_state_rejects_conflicts_missing_and_invalid_types(self):
         from unittest.mock import Mock
@@ -386,7 +386,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
         old = clients[1].generate(context="Receipt", schema={"type": "object", "properties": questions}).result
         self.assertEqual(new, {"expense": "travel", "paid": True})
         self.assertEqual(new, old)
-        self.assertEqual(clients[0].last_prompts, clients[1].last_prompts)
+        self.assertEqual(clients[0]._last_prompts.get(), clients[1]._last_prompts.get())
 
     def test_questions_numeric_and_reserved_field_names(self):
         client = TypeLLMClient()
@@ -506,7 +506,7 @@ class ThinkingTests(unittest.TestCase):
                 prompt = render(messages, add_generation_prompt=add_generation_prompt)
                 return thinking._finish_thinking(prompt + "<think>") if add_generation_prompt else prompt
             fake.render_chat = render_with_thinking
-            def generate_texts(prefixes, limits, **kwargs):
+            def generate_texts(prefixes, **kwargs):
                 self.assertTrue(all(p.endswith('</think>\n\n{"t":') for p in prefixes))
                 return ["blue"] * len(prefixes)
             fake.generate_texts = generate_texts
@@ -671,7 +671,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             fake.number_prefixes[0],
         )
         self.assertTrue(fake.number_prefixes[0].endswith('<assistant>{"count":'))
-        self.assertIn('<assistant>{"count": 42}</assistant>', client.last_prompts[0])
+        self.assertIn('<assistant>{"count": 42}</assistant>', client._last_prompts.get()[0])
 
     def test_open_float_supports_sign_decimal_and_message_termination(self):
         schema = {
@@ -687,9 +687,9 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         self.assertEqual(result, {"temperature": -0.75})
         self.assertIn(
             'Answer as {"temperature": <number>}. Do not use exponent notation.',
-            client.last_prompts[0],
+            client._last_prompts.get()[0],
         )
-        self.assertIn('<assistant>{"temperature": -0.75}</assistant>', client.last_prompts[0])
+        self.assertIn('<assistant>{"temperature": -0.75}</assistant>', client._last_prompts.get()[0])
 
     def test_open_integer_beyond_float_range_preserves_value(self):
         big = 10**400
@@ -837,8 +837,8 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         result = client.generate(context="context", schema=schema).result
 
         self.assertEqual(result, {"count": 7, "enabled": True})
-        self.assertIn('<assistant>{"count": 7}</assistant>', client.last_prompts[0])
-        self.assertIn('<assistant>{"enabled": "A"}</assistant>', client.last_prompts[1])
+        self.assertIn('<assistant>{"count": 7}</assistant>', client._last_prompts.get()[0])
+        self.assertIn('<assistant>{"enabled": "A"}</assistant>', client._last_prompts.get()[1])
 
     def test_batch_prefills_once_and_forks_independent_questions(self):
         schema = {
@@ -868,7 +868,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         self.assertIn("Choose a scale.", fake.batch_prompts[0][0])
         self.assertIn("Enable it?", fake.batch_prompts[0][1])
         self.assertNotIn("value=0.5", fake.batch_prompts[0][1])
-        self.assertEqual(len(client.last_prompts), 2)
+        self.assertEqual(len(client._last_prompts.get()), 2)
 
     def test_native_batch_request_uses_per_prompt_candidate_ids(self):
         client = RecordingSGLangClient()

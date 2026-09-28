@@ -44,7 +44,7 @@ class SharedClientTests(unittest.TestCase):
                 "a": {"type": "integer"}, "b": {"type": "boolean"},
             }).result
             finished.wait()  # Every call has finished before any reads its prompts.
-            return n, client.last_prompts
+            return n, client._last_prompts.get()
 
         with ThreadPoolExecutor(8) as pool:
             for n, prompts in pool.map(run, range(16)):
@@ -57,9 +57,9 @@ class SharedClientTests(unittest.TestCase):
         client.sglang = FakeServer()
         state = client.rng.getstate()
         client.generate(context="Roll", questions=PICK, seed=5).result
-        first = client.last_prompts
+        first = client._last_prompts.get()
         client.generate(context="Roll", questions=PICK, seed=5).result
-        self.assertEqual(client.last_prompts, first)
+        self.assertEqual(client._last_prompts.get(), first)
         self.assertEqual(client.rng.getstate(), state)
         client.generate(context="Roll", questions=PICK).result
         self.assertNotEqual(client.rng.getstate(), state)
@@ -69,9 +69,9 @@ class SharedClientTests(unittest.TestCase):
         client.sglang = FakeServer()
         client.generate(context="Receipt", questions={"b": {"type": "boolean"}}).result
         copy = pickle.loads(pickle.dumps(client))
-        self.assertEqual(copy.last_prompts, [])
+        self.assertEqual(copy._last_prompts.get(), [])
         copy.generate(context="Receipt", questions={"b": {"type": "boolean"}}).result
-        self.assertEqual(len(copy.last_prompts), 1)
+        self.assertEqual(len(copy._last_prompts.get()), 1)
 
 
 class MeteredServer(SlowServer):
@@ -114,6 +114,11 @@ class UsageTests(unittest.TestCase):
         client.sglang.payloads.clear()
         usage = client.generate(context="Receipt", questions={"b": {"type": "boolean"}}).usage
         self.assertEqual(usage.requests, len(client.sglang.payloads))
+
+    def test_usage_shows_billed_tokens_first_and_only_counts_it_has(self):
+        self.assertEqual(repr(Usage(input_tokens=66)), "Usage(input_tokens=66, thinking_tokens=0)")
+        self.assertEqual(repr(Usage(input_tokens=5, requests=2, prompt_tokens=30)),
+                         "Usage(input_tokens=5, thinking_tokens=0, requests=2, prompt_tokens=30)")
 
     def test_concurrent_calls_count_only_their_own_requests(self):
         client = TypeLLMClient(model="fake")

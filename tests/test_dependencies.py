@@ -51,7 +51,7 @@ class DependencyTests(unittest.TestCase):
         for name in ('root', 'left', 'right'):
             self.assertIn(f'"{name}": true', final)
         self.assertNotIn('unrelated', final)
-        self.assertIn('Field: "final"', client.last_prompts[0])
+        self.assertIn('Field: "final"', client._last_prompts.get()[0])
         self.assertTrue(result['root']['value'])
 
     def test_incremental_prefixes_and_unique_warmups(self):
@@ -62,7 +62,7 @@ class DependencyTests(unittest.TestCase):
             'c': {'type': 'boolean', 'depends_on': ['a']},
             'd': {'type': 'boolean', 'depends_on': ['b', 'c']},
         }).result
-        a, b, c, d = client.last_prompts
+        a, b, c, d = client._last_prompts.get()
         self.assertTrue(b.startswith(a))
         self.assertTrue(c.startswith(a))
         self.assertTrue(d.startswith(b))
@@ -83,7 +83,7 @@ class DependencyTests(unittest.TestCase):
             'a': {'type': 'boolean'},
             'b': {'type': 'boolean', 'depends_on': ['a']},
         }).result
-        a, b = client.last_prompts
+        a, b = client._last_prompts.get()
         self.assertTrue(b.startswith(a))
         self.assertEqual(a.count('<think>retained reasoning</think>'), 1)
         self.assertEqual(b.count('<think>retained reasoning</think>'), 2)
@@ -98,8 +98,8 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(result['pick']['value'], 23)
         self.assertEqual(len(result['pick']['probabilities']), 24)
         self.assertEqual(list(client.label_token_map)[:24], list('ABCDEFGHIJKLMNOPQRSTUVWX'))
-        self.assertIn('"pick": 23', client.last_prompts[1])
-        self.assertTrue(client.last_prompts[1].startswith(client.last_prompts[0]))
+        self.assertIn('"pick": 23', client._last_prompts.get()[1])
+        self.assertTrue(client._last_prompts.get()[1].startswith(client._last_prompts.get()[0]))
 
     def test_always_thinking_template_continuation_runs_once(self):
         client = SGLangClient()
@@ -151,18 +151,18 @@ class DependencyTests(unittest.TestCase):
             'check': {'type': 'boolean', 'depends_on': ['number']},
         }).result
         self.assertEqual(result, {'number': 7, 'check': True})
-        self.assertTrue(client.last_prompts[1].startswith(client.last_prompts[0]))
+        self.assertTrue(client._last_prompts.get()[1].startswith(client._last_prompts.get()[0]))
         self.assertIn('"number": 7', client.sglang.batch_prompts[0][0])
 
     def test_text_dependency_and_schema_interface(self):
         client = self.client()
-        client.sglang.generate_texts = lambda prompts, limits, **kwargs: ['hello "世界"'] * len(prompts)
+        client.sglang.generate_texts = lambda prompts, **kwargs: ['hello "世界"'] * len(prompts)
         result = client.generate(context='', schema={'type': 'object', 'properties': {
             'text': {'type': 'string'},
             'check': {'type': 'boolean', 'depends_on': ['text']},
         }}).result
         self.assertEqual(result['text'], 'hello "世界"')
-        self.assertTrue(client.last_prompts[1].startswith(client.last_prompts[0]))
+        self.assertTrue(client._last_prompts.get()[1].startswith(client._last_prompts.get()[0]))
         self.assertIn('"text": "hello \\"世界\\""', client.sglang.batch_prompts[0][0])
 
     def test_fields_without_dependencies_run_together(self):
