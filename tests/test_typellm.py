@@ -158,7 +158,7 @@ class JsonSchemaCompilerTests(unittest.TestCase):
                 with self.subTest(old_key=old_key, extra=extra):
                     with self.assertRaisesRegex(SchemaError, "use instructions"):
                         compile_json_schema({"type": "object", "properties": {"paid": field}})
-                    client = TypeLLMClient()
+                    client = TypeLLMClient("http://127.0.0.1:30000")
                     for kwargs in [
                         {"questions": {"paid": field}},
                         {"schema": {"properties": [{**field, "type": "bool", "name": "paid"}]}},
@@ -174,7 +174,7 @@ class JsonSchemaCompilerTests(unittest.TestCase):
                 }})
 
     def test_legacy_list_accepts_instructions(self):
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         client.sglang = FakeSGLang()
         schema = {"properties": [{"name": "paid", "type": "bool", "instructions": "Is it paid?"}]}
         self.assertEqual(client.compile_schema(schema)[0].question, "Is it paid?")
@@ -345,7 +345,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
     def test_state_and_context_produce_identical_prompts(self):
         questions = {"paid": {"type": "boolean", "instructions": "Is it paid?"}}
         for text in ["Receipt", ""]:
-            clients = [TypeLLMClient(), TypeLLMClient()]
+            clients = [TypeLLMClient("http://127.0.0.1:30000"), TypeLLMClient("http://127.0.0.1:30000")]
             for client in clients:
                 client.sglang = FakeSGLang([ord("A")])
             a = clients[0].generate(state=text, questions=questions).result
@@ -358,7 +358,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
         for kwargs in [{}, {"state": "x", "context": "x"},
                        {"state": "", "context": ""}, {"state": 1},
                        {"state": {}}, {"context": []}]:
-            client = TypeLLMClient()
+            client = TypeLLMClient("http://127.0.0.1:30000")
             client.sglang = Mock()
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 client.generate(questions={"paid": {"type": "boolean"}}, **kwargs).result
@@ -375,12 +375,16 @@ class QuestionsInterfaceTests(unittest.TestCase):
             run_schema("Paid", state="Paid", questions=questions).result
 
     def test_questions_match_schema(self):
+        from unittest.mock import patch
         questions = {
             "expense": {"type": "string", "enum": ["meal", "travel"], "instructions": "Classify."},
             "paid": {"type": "boolean", "instructions": "Is it paid?"},
         }
-        clients = [TypeLLMClient(), TypeLLMClient()]
+        # Local tests must stay local even when a developer has a hosted key.
+        with patch.dict("os.environ", {"TYPELLM_API_KEY": "env"}):
+            clients = [TypeLLMClient("http://127.0.0.1:30000"), TypeLLMClient("http://127.0.0.1:30000")]
         for client in clients:
+            self.assertIsNone(client.api_key)
             client.sglang = FakeSGLang([ord("B"), ord("A")])
         new = clients[0].generate(context="Receipt", questions=questions).result
         old = clients[1].generate(context="Receipt", schema={"type": "object", "properties": questions}).result
@@ -389,7 +393,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
         self.assertEqual(clients[0]._last_prompts.get(), clients[1]._last_prompts.get())
 
     def test_questions_numeric_and_reserved_field_names(self):
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         client.sglang = FakeSGLang([ord("A")])
         result = client.generate(context="Seven", questions={
             "type": {"type": "integer", "instructions": "Extract the number."},
@@ -400,7 +404,7 @@ class QuestionsInterfaceTests(unittest.TestCase):
     def test_questions_invalid_inputs_fail_before_network(self):
         for kwargs in [{}, {"questions": {}, "schema": {}}, {"questions": {}},
                        {"questions": []}, {"questions": "bad"}, {"questions": {"x": None}}]:
-            client = TypeLLMClient()
+            client = TypeLLMClient("http://127.0.0.1:30000")
             with self.subTest(kwargs=kwargs), self.assertRaises(SchemaError):
                 client.generate(context="Context", **kwargs).result
 
@@ -421,7 +425,7 @@ class ThinkingTests(unittest.TestCase):
         from unittest.mock import Mock, patch
         from typellm import run_schema
         self.assertIsNone(SGLangClient().thinking_budget)
-        self.assertIsNone(TypeLLMClient().sglang.thinking_budget)
+        self.assertIsNone(TypeLLMClient("http://127.0.0.1:30000").sglang.thinking_budget)
         client = SGLangClient()
         client._chat_tokenizer = FakeChatTokenizer()
         client._context_length_cache = 8192
@@ -510,7 +514,7 @@ class ThinkingTests(unittest.TestCase):
                 self.assertTrue(all(p.endswith('</think>\n\n{"t":') for p in prefixes))
                 return ["blue"] * len(prefixes)
             fake.generate_texts = generate_texts
-            client = TypeLLMClient()
+            client = TypeLLMClient("http://127.0.0.1:30000")
             client.sglang = fake
             self.assertEqual(client.generate(context="test", questions={
                 "n": {"type": "integer"}, "b": {"type": "boolean"}, "t": {"type": "string"},
@@ -610,7 +614,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
                 },
             },
         }
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         fake = FakeSGLang([ord("K")])
         client.sglang = fake
 
@@ -639,7 +643,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             "required": ["scale", "enabled"],
         }
         from tests.test_dependencies import DependencyFake
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         fake = DependencyFake([ord("B"), ord("A")])
         client.sglang = fake
 
@@ -658,7 +662,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
                 "enabled": {"type": "boolean"},
             },
         }
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         fake = FakeSGLang([ord("A")], numbers=[" 42}"])
         client.sglang = fake
 
@@ -678,7 +682,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
             "type": "object",
             "properties": {"temperature": {"type": "number"}},
         }
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         fake = FakeSGLang(numbers=[" -0.75"])  # ends at the end of the message
         client.sglang = fake
 
@@ -695,7 +699,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         big = 10**400
         for value in (big, -big):
             with self.subTest(value=value):
-                client = TypeLLMClient(numeric_max_digits=401)
+                client = TypeLLMClient("http://127.0.0.1:30000", numeric_max_digits=401)
                 client.sglang = FakeSGLang(numbers=[f" {value}}}"])
                 result = client.generate(context="context", questions={"n": {"type": "integer"}}).result
                 self.assertEqual(result, {"n": value})
@@ -704,13 +708,13 @@ class JsonSchemaExecutionTests(unittest.TestCase):
     def test_open_number_still_rejects_float_overflow(self):
         for sign in ("", "-"):
             with self.subTest(sign=sign):
-                client = TypeLLMClient(numeric_max_digits=401)
+                client = TypeLLMClient("http://127.0.0.1:30000", numeric_max_digits=401)
                 client.sglang = FakeSGLang(numbers=[f" {sign}{10**400}}}"])
                 with self.assertRaisesRegex(ValueError, "non-finite number"):
                     client.generate(context="context", questions={"n": {"type": "number"}}).result
 
     def test_text_prompt_keeps_non_ascii_field_names_readable(self):
-        [compiled] = TypeLLMClient().compile_schema(
+        [compiled] = TypeLLMClient("http://127.0.0.1:30000").compile_schema(
             {"type": "object", "properties": {"名称": {"type": "string"}}}
         )
         self.assertIn('Field: "名称"', compiled.opening_text())
@@ -830,7 +834,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
                 "enabled": {"type": "boolean"},
             },
         }
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         fake = FakeSGLang([ord("A")])
         client.sglang = fake
 
@@ -855,7 +859,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
                 },
             },
         }
-        client = TypeLLMClient()
+        client = TypeLLMClient("http://127.0.0.1:30000")
         fake = FakeSGLang([ord("B"), ord("A")])
         client.sglang = fake
 
@@ -956,7 +960,7 @@ class HostedApiTests(unittest.TestCase):
                          [240, 30, None])
         self.assertEqual([request.extensions["timeout"]["read"] for request in seen],
                          [300, 90, 180])
-        self.assertEqual(TypeLLMClient().sglang.timeout, 120)
+        self.assertEqual(TypeLLMClient("http://127.0.0.1:30000").sglang.timeout, 120)
 
     def test_hosted_rejects_invalid_timeouts_before_sending(self):
         sent = []
@@ -979,6 +983,41 @@ class HostedApiTests(unittest.TestCase):
             self.assertEqual(caught.exception.status, status)
         with self.assertRaises(ValueError):  # only local compilation takes a raw schema
             client.generate(context="x", schema={"type": "object", "properties": {"a": {"type": "boolean"}}}).result
+
+    def test_env_key_applies_only_without_api_key_and_base_url(self):
+        from unittest.mock import patch
+        with patch.dict("os.environ", {"TYPELLM_API_KEY": "env"}):
+            self.assertEqual(TypeLLMClient().api_key, "env")
+            self.assertEqual(TypeLLMClient(model="m").api_key, "env")
+            self.assertEqual(TypeLLMClient(api_key="k").api_key, "k")
+            self.assertIsNone(TypeLLMClient("http://127.0.0.1:30000").api_key)
+        with patch.dict("os.environ", {"TYPELLM_API_KEY": " env\n"}):
+            client = TypeLLMClient()
+            self.assertEqual(client.api_key, "env")
+            self.assertIsNone(client.sglang)
+            self.assertEqual(client.base_url, "https://api.typellm.ai")
+            self.assertEqual(TypeLLMClient(api_key=" k\n").api_key, "k")
+            for blank in ("", " \n"):  # never swapped for the env key
+                with self.subTest(blank=blank), self.assertRaisesRegex(ValueError, "api_key is empty"):
+                    TypeLLMClient(api_key=blank)
+        for blank in ("", " \n"):
+            with patch.dict("os.environ", {"TYPELLM_API_KEY": blank}):
+                self.assertIsNone(TypeLLMClient().api_key)
+        with patch.dict("os.environ", {}, clear=True):
+            client = TypeLLMClient()
+            self.assertIsNone(client.api_key)
+            self.assertEqual(client.sglang.base_url, "http://127.0.0.1:30000")
+
+    def test_hosted_rejects_options_only_own_server_uses(self):
+        from unittest.mock import patch
+        for option in ({"tokenizer": "t"}, {"text_max_tokens": 64},
+                       {"numeric_max_digits": 8}, {"label_pool": "AB"}):
+            with self.subTest(option=option), self.assertRaisesRegex(ValueError, "your own server"):
+                TypeLLMClient(api_key="k", **option)
+        with patch.dict("os.environ", {"TYPELLM_API_KEY": "env"}):
+            with self.assertRaisesRegex(ValueError, "tokenizer can only be set"):
+                TypeLLMClient(tokenizer="t")
+            self.assertIsNone(TypeLLMClient("http://127.0.0.1:30000", tokenizer="t").api_key)
 
     def test_hosted_compile_schema_requires_own_server(self):
         client = TypeLLMClient(api_key="k")
@@ -1024,5 +1063,5 @@ class DecodingTests(unittest.TestCase):
             _resolve_decoding("sample", 0)
 
     def test_call_temperature_overrides_client(self):
-        client = TypeLLMClient(model="fake", temperature=0.7)
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake", temperature=0.7)
         self.assertEqual((client.mode, client.temperature), ("sample", 0.7))

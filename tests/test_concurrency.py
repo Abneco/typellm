@@ -35,7 +35,7 @@ class SlowServer(FakeServer):
 
 class SharedClientTests(unittest.TestCase):
     def test_concurrent_calls_keep_their_own_prompts(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = SlowServer()
         finished = threading.Barrier(8)
 
@@ -53,7 +53,7 @@ class SharedClientTests(unittest.TestCase):
                     self.assertIn(f"Receipt {n}", prompt)
 
     def test_a_seeded_call_is_reproducible_and_leaves_the_shared_stream(self):
-        client = TypeLLMClient(model="fake", seed=1)
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake", seed=1)
         client.sglang = FakeServer()
         state = client.rng.getstate()
         client.generate(context="Roll", questions=PICK, seed=5).result
@@ -65,7 +65,7 @@ class SharedClientTests(unittest.TestCase):
         self.assertNotEqual(client.rng.getstate(), state)
 
     def test_clients_pickle_after_a_call(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = FakeServer()
         client.generate(context="Receipt", questions={"b": {"type": "boolean"}}).result
         copy = pickle.loads(pickle.dumps(client))
@@ -100,7 +100,7 @@ class UsageTests(unittest.TestCase):
     QUESTIONS = {"a": {"type": "integer"}, "b": {"type": "boolean"}, "c": {"type": "string"}}
 
     def test_usage_sums_every_generate_request_of_the_call(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = MeteredServer()
         usage = client.generate(context="Receipt", questions=self.QUESTIONS).usage
         n = prompts_sent(client.sglang)
@@ -121,7 +121,7 @@ class UsageTests(unittest.TestCase):
                          "Usage(input_tokens=5, thinking_tokens=0, requests=2, prompt_tokens=30)")
 
     def test_concurrent_calls_count_only_their_own_requests(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = MeteredServer()
         finished = threading.Barrier(4)
 
@@ -139,7 +139,7 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(sum(counts), len(client.sglang.payloads))
 
     def test_a_failed_call_still_reports_the_requests_it_made(self):
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = MeteredServer(fail_after=2)
         with self.assertRaisesRegex(SGLangError, "went away") as caught:
             client.generate(context="Receipt", questions=self.QUESTIONS)
@@ -160,7 +160,7 @@ class DeadlineTests(unittest.TestCase):
                     time.sleep(0.03)
                 return super()._request(path, payload, allow_text=allow_text)
 
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = Slower()
         client.generate(context="Receipt", questions=self.QUESTIONS).result
         needed = len(client.sglang.payloads)
@@ -180,7 +180,7 @@ class DeadlineTests(unittest.TestCase):
                     cancel.set()
                 return response
 
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = Cancelling()
         with self.assertRaises(GenerationCancelled):
             client.generate(context="Receipt", questions=self.QUESTIONS, cancel=cancel).result
@@ -254,7 +254,7 @@ class DeadlineTests(unittest.TestCase):
                 self.paths.append(path)
                 return super()._request(path, payload, allow_text=allow_text)
 
-        client = TypeLLMClient(model="fake")
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = Recording()
         client.sglang.paths = []
         for kwargs in ({"timeout": 0}, {"timeout": -1}, {"timeout": True}, {"timeout": "5"},
