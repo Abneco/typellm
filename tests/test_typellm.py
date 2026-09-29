@@ -796,6 +796,16 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         client.close()
         self.assertTrue(pool.is_closed)
         self.assertIsNot(client._http(), pool)
+
+    def test_closing_a_local_client_closes_its_sglang_connections(self):
+        sglang = SGLangClient()
+        client = TypeLLMClient("http://127.0.0.1:30000", model="m")
+        client.sglang = sglang
+        pool = sglang._http()
+        with client:
+            pass
+        self.assertTrue(pool.is_closed)
+
     def test_info_endpoints_use_current_sglang_names(self):
         from unittest.mock import Mock
         client = SGLangClient()

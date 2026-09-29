@@ -556,9 +556,10 @@ class TypeLLMClient:
     def _http(self) -> httpx.Client:
         with self._http_lock:
             if self._http_client is None:
-                # A new connection costs a TCP and a TLS handshake, so calls reuse them. Idle
-                # ones close after a minute, long before the load balancer drops them (610 s).
-                # No caps on how many: the service limits concurrent calls itself.
+                # One client for every call: making one loads the CA bundle (tens of ms of CPU),
+                # and a new connection costs a TCP and a TLS handshake. Idle connections close
+                # after a minute, long before the load balancer drops them (610 s). No caps on
+                # how many: the service limits concurrent calls itself.
                 self._http_client = httpx.Client(limits=httpx.Limits(keepalive_expiry=60))
             return self._http_client
 
