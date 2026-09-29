@@ -8,12 +8,14 @@
   <a href="https://typellm.ai/">Homepage</a>&nbsp; • &nbsp;
   <a href="https://typellm.ai/blog">Blog</a>&nbsp; • &nbsp;
   <a href="https://typellm.ai/docs">Docs</a>&nbsp; • &nbsp;
-  <a href="https://typellm.ai/early-access">Early Access</a>&nbsp; • &nbsp;
+  <a href="https://typellm.ai/examples">Examples</a>&nbsp; • &nbsp;
+  <a href="https://typellm.ai/dashboard">API</a>&nbsp; • &nbsp;
   <a href="https://typellm.ai/contact">Contact</a>&nbsp;
 </h4>
 </div>
 
 ## Updates
+- **[2026/09/29]** The [TypeLLM API](https://typellm.ai) is live: typed outputs without serving a model yourself, and $5 of credit for new accounts. [Get early access](https://typellm.ai/early-access) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
 - **[2026/09/24]** Added [image input](#image-input) for vision-language models, tested with Qwen3.8-27B.
 - **[2026/09/23]** Added [JevBench results](https://github.com/TypeLLM/TypeLLM/blob/main/evals/jevbench/README.md): TypeLLM scored 195/231 without thinking and 228/231 with thinking.
 - **[2026/09/23]** Added [permutation averaging](#per-question-permutation-averaging) to improve the predictive distribution. See the [blog post](https://typellm.ai/blog/fair-die).
@@ -51,7 +53,33 @@ Evaluated on 231 public [JevBench](https://github.com/fstandhartinger/jevbench) 
 
 ## Quick start
 
-### 1. Serve a model with SGLang
+```bash
+pip install -U typellm
+```
+
+Call the hosted TypeLLM API, or run TypeLLM against a model you serve yourself.
+Both clients take the same requests.
+
+### TypeLLM API (cloud)
+
+[Sign in](https://typellm.ai/login), enter your access code on the
+[API keys](https://typellm.ai/dashboard/keys) page and create a key. No code yet?
+[Get early access](https://typellm.ai/early-access).
+
+```bash
+export TYPELLM_API_KEY="tl-sk-..."
+```
+
+```python
+import os
+from typellm import TypeLLMClient
+
+client = TypeLLMClient(api_key=os.environ["TYPELLM_API_KEY"])
+```
+
+See the [API reference](https://typellm.ai/docs/api) to call it over HTTP instead.
+
+### Self-hosted with SGLang
 
 Use [SGLang](https://github.com/sgl-project/sglang) to configure and serve a
 compatible autoregressive model on your local GPU server. This example uses
@@ -60,12 +88,6 @@ Qwen3.8-27B; follow the
 to start it with prefix caching enabled.
 
 See [Supported models](#supported-models) for tested checkpoints and thinking behavior.
-
-### 2. Run TypeLLM
-
-```bash
-pip install -U typellm
-```
 
 Point `TypeLLMClient` at the SGLang server's HTTP endpoint:
 
@@ -78,7 +100,9 @@ client = TypeLLMClient(
 )
 ```
 
-Example request:
+### Make a request
+
+With either client:
 
 ```python
 response = client.generate(
