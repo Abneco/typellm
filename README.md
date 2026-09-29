@@ -422,7 +422,7 @@ support this option.
 ## Serving
 
 One `TypeLLMClient` can be shared by many threads. Each call keeps its own
-prompts and usage, and connections to SGLang are reused.
+prompts and usage, and connections to SGLang or the hosted API are reused.
 
 ```python
 import threading
