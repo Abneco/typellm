@@ -187,7 +187,8 @@ class TypeLLMClient:
         at that temperature. mode is deprecated: temperature alone decides.
 
         A hosted call that gets HTTP 429, a 5xx other than 504 or a connection
-        error is retried up to max_retries times.
+        error is retried up to max_retries times. Hosted calls share connections
+        kept open between them; close(), or leaving a with block, closes them.
         """
         mode, temperature = _resolve_decoding(mode, temperature)
         if type(numeric_max_digits) is not int or numeric_max_digits <= 0:
@@ -224,7 +225,9 @@ class TypeLLMClient:
             self.model = model
             self.timeout = timeout
             self.max_retries = max_retries
-            self._transport: httpx.BaseTransport | None = None  # tests put a MockTransport here
+        # The hosted API's connections: opened by the first call, kept for the next.
+        self._http_client: httpx.Client | None = None
+        self._http_lock = threading.Lock()
         self.mode = mode
         self.temperature = temperature
         self.rng = random.Random(seed)
@@ -240,11 +243,29 @@ class TypeLLMClient:
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         del state["_last_prompts"]
+        del state["_http_lock"]
+        state["_http_client"] = None  # Each copy opens its own connections.
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._last_prompts = ContextVar(f"typellm_last_prompts_{id(self)}", default=[])
+        self._http_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Close the connections to the hosted API or to SGLang; a later call reopens them."""
+        with self._http_lock:
+            http_client, self._http_client = self._http_client, None
+        if http_client is not None:
+            http_client.close()
+        if self.sglang is not None:
+            self.sglang.close()
+
+    def __enter__(self) -> "TypeLLMClient":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
 
 
     def _control_labels(self, count: int) -> list[str]:
@@ -532,36 +553,46 @@ class TypeLLMClient:
                               status=response.status_code) from exc
         return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens))
 
+    def _http(self) -> httpx.Client:
+        with self._http_lock:
+            if self._http_client is None:
+                # One client for every call: making one loads the CA bundle (tens of ms of CPU),
+                # and a new connection costs a TCP and a TLS handshake. A connection idle for a
+                # minute is dropped at the next call, long before the load balancer drops it
+                # (610 s). No caps on how many: the service limits concurrent calls itself.
+                self._http_client = httpx.Client(limits=httpx.Limits(keepalive_expiry=60))
+            return self._http_client
+
     def _post_hosted(self, body: dict[str, Any], timeout: float) -> httpx.Response:
         """POST /v1/generate, retrying a 429, a 5xx other than 504 or a connection error.
 
         A timeout, the socket's or the service's 504, is final: the call has had its time.
         """
+        http = self._http()
         attempt = 0
-        with httpx.Client(transport=self._transport) as http:
-            while True:
-                try:
-                    response = http.post(self.base_url + "/v1/generate", json=body, timeout=timeout,
-                                         headers={"Authorization": f"Bearer {self.api_key}"})
-                except httpx.HTTPError as exc:
-                    if attempt == self.max_retries or isinstance(exc, httpx.TimeoutException):
-                        raise SGLangError(
-                            f"Could not reach the TypeLLM API at {self.base_url}: {exc!r}") from exc
-                    problem, retry_after = repr(exc), None
-                else:
-                    status = response.status_code
-                    if attempt == self.max_retries or not (status == 429 or (status >= 500 and status != 504)):
-                        return response
-                    problem, retry_after = f"HTTP {status}", response.headers.get("Retry-After")
-                try:  # the service's Retry-After, up to a minute
-                    delay = float(retry_after or 0)
-                except ValueError:
-                    delay = 0.0
-                if not 0 < delay <= 60:  # else 0.5 s, 1 s, 2 s ... 8 s, less up to 25% jitter
-                    delay = 0.5 * 2 ** min(attempt, 4) * (1 - 0.25 * random.random())
-                LOG.info("TypeLLM API call failed (%s); retrying in %.2f s", problem, delay)
-                time.sleep(delay)
-                attempt += 1
+        while True:
+            try:
+                response = http.post(self.base_url + "/v1/generate", json=body, timeout=timeout,
+                                     headers={"Authorization": f"Bearer {self.api_key}"})
+            except httpx.HTTPError as exc:
+                if attempt == self.max_retries or isinstance(exc, httpx.TimeoutException):
+                    raise SGLangError(
+                        f"Could not reach the TypeLLM API at {self.base_url}: {exc!r}") from exc
+                problem, retry_after = repr(exc), None
+            else:
+                status = response.status_code
+                if attempt == self.max_retries or not (status == 429 or (status >= 500 and status != 504)):
+                    return response
+                problem, retry_after = f"HTTP {status}", response.headers.get("Retry-After")
+            try:  # the service's Retry-After, up to a minute
+                delay = float(retry_after or 0)
+            except ValueError:
+                delay = 0.0
+            if not 0 < delay <= 60:  # else 0.5 s, 1 s, 2 s ... 8 s, less up to 25% jitter
+                delay = 0.5 * 2 ** min(attempt, 4) * (1 - 0.25 * random.random())
+            LOG.info("TypeLLM API call failed (%s); retrying in %.2f s", problem, delay)
+            time.sleep(delay)
+            attempt += 1
 
 
 def candidate_softmax(

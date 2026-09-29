@@ -1,4 +1,5 @@
 import json
+import pickle
 import random
 import unittest
 from unittest import mock
@@ -795,6 +796,16 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         client.close()
         self.assertTrue(pool.is_closed)
         self.assertIsNot(client._http(), pool)
+
+    def test_closing_a_local_client_closes_its_sglang_connections(self):
+        sglang = SGLangClient()
+        client = TypeLLMClient("http://127.0.0.1:30000", model="m")
+        client.sglang = sglang
+        pool = sglang._http()
+        with client:
+            pass
+        self.assertTrue(pool.is_closed)
+
     def test_info_endpoints_use_current_sglang_names(self):
         from unittest.mock import Mock
         client = SGLangClient()
@@ -901,7 +912,7 @@ class HostedApiTests(unittest.TestCase):
 
     def client(self, handler, **options):
         client = TypeLLMClient(api_key="k", **options)
-        client._transport = httpx.MockTransport(handler)
+        client._http_client = httpx.Client(transport=httpx.MockTransport(handler))
         return client
 
     def replying(self, *replies, **options):
@@ -1068,6 +1079,19 @@ class HostedApiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compile_schema needs your own server"):
             client.compile_schema({"type": "object", "properties": {"a": {"type": "boolean"}}})
 
+    def test_hosted_calls_share_one_connection_pool(self):
+        client = self.client(lambda request: httpx.Response(200, json={
+            "result": {"a": True}, "usage": {"input_tokens": 1, "thinking_tokens": 0}}))
+        pool = client._http()
+        for _ in range(3):
+            client.generate(context="x", questions={"a": {"type": "boolean"}})
+        self.assertIs(client._http(), pool)
+        self.assertIsNone(pickle.loads(pickle.dumps(client))._http_client)  # a copy opens its own
+        with client:
+            pass
+        self.assertTrue(pool.is_closed)
+        self.assertIsNot(client._http(), pool)  # a later call reopens them
+
     def test_hosted_invalid_responses_fail_clearly(self):
         questions = {"a": {"type": "boolean"}}
         client = TypeLLMClient(api_key="k")
@@ -1077,7 +1101,7 @@ class HostedApiTests(unittest.TestCase):
                                                    "usage": {"input_tokens": 1, "thinking_tokens": 0}}),
                          httpx.Response(302, headers={"Location": "/elsewhere"})):
             with self.subTest(status=response.status_code):
-                client._transport = httpx.MockTransport(lambda request: response)
+                client._http_client = httpx.Client(transport=httpx.MockTransport(lambda request: response))
                 with self.assertRaises(SGLangError) as caught:
                     client.generate(context="x", questions=questions).result
                 self.assertEqual(caught.exception.status, response.status_code)
