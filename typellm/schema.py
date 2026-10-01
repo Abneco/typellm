@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
@@ -32,6 +33,38 @@ class Decision:
     # None follows the client's thinking and thinking_budget.
     thinking: bool | None = None
     thinking_budget: int | None = None
+    # thinking: "auto" adds a hidden question that picks the effort per call:
+    # effort_from on the field names that question, effort_for on it names the field.
+    effort_from: str | None = None
+    effort_for: str | None = None
+
+
+# thinking_effort levels and their budgets; "none" does not think.
+THINKING_EFFORTS = {"none": None, "low": 512, "medium": 2048, "high": 4096}
+
+EFFORT_QUESTION = (
+    "Before the question below is answered, decide how much step-by-step reasoning it needs.\n"
+    "none: the answer is stated directly or is obvious.\n"
+    "low: a short check or one simple inference.\n"
+    "medium: several steps of reasoning or calculation.\n"
+    "high: hard, many-step or high-stakes reasoning.\n\n"
+    "The question:\n{question}"
+)
+
+
+def _describe(decision: Decision) -> str:
+    """A field's type, instructions and choices, as its own prompt states them."""
+    or_null = " or null" if decision.nullable else ""
+    if decision.text_type:
+        kind = "string" + or_null
+    elif decision.numeric_type is not None:
+        kind = decision.numeric_type + or_null
+    else:
+        kind = "boolean" if decision.syntax == "Bool" else "choice"
+    lines = [f"Type: {kind}", f"Instructions: {decision.question}"]
+    if decision.choices and decision.syntax != "Bool":
+        lines.append(f"Choices: {json.dumps(list(decision.choices), ensure_ascii=False)}")
+    return "\n".join(lines)
 
 
 def _has_duplicates(values: Sequence[Any]) -> bool:
@@ -220,16 +253,52 @@ def compile_json_schema(schema: Mapping[str, Any]) -> list[Decision]:
                 raise SchemaError(f"depends_on for {decision.name!r} must be a list of field names")
             if len(set(dependencies)) != len(dependencies):
                 raise SchemaError(f"depends_on for {decision.name!r} contains duplicates")
+            # Only the caller's fields: the hidden effort questions are not theirs to name.
+            for dependency in dependencies:
+                if dependency not in properties:
+                    raise SchemaError(f"unknown dependency {dependency!r} for {decision.name!r}")
             dependencies = tuple(dependencies)
-        thinking = field.get("thinking")
-        if thinking is not None and type(thinking) is not bool:
-            raise SchemaError(f"thinking for {decision.name!r} must be a boolean")
-        budget = field.get("thinking_budget")
-        if budget is not None and (type(budget) is not int or budget <= 0):
-            raise SchemaError(f"thinking_budget for {decision.name!r} must be a positive integer")
+        thinking, budget = _thinking_settings(decision.name, field)
+        if thinking == "auto":
+            effort = f"{decision.name}.thinking_effort"
+            if effort in properties:
+                raise SchemaError(f"field name {effort!r} is taken by thinking: \"auto\" on {decision.name!r}")
+            # Asked with the field's own dependencies, never thinks, and runs one layer before it.
+            compiled.append(Decision(effort, EFFORT_QUESTION.format(question=_describe(decision)),
+                                     tuple(THINKING_EFFORTS), depends_on=dependencies, thinking=False,
+                                     effort_for=decision.name))
+            compiled.append(replace(decision, depends_on=(dependencies or ()) + (effort,), effort_from=effort))
+            continue
         compiled.append(replace(decision, depends_on=dependencies, thinking=thinking, thinking_budget=budget))
     dependency_layers(compiled)
     return compiled
+
+
+def _thinking_settings(name: str, field: Mapping[str, Any]) -> tuple[bool | str | None, int | None]:
+    """A field's thinking ("auto" included) and budget, from thinking, thinking_effort and thinking_budget."""
+    thinking = field.get("thinking")
+    if thinking is not None and type(thinking) is not bool and thinking != "auto":
+        raise SchemaError(f'thinking for {name!r} must be a boolean or "auto"')
+    budget = field.get("thinking_budget")
+    if budget is not None and (type(budget) is not int or budget <= 0):
+        raise SchemaError(f"thinking_budget for {name!r} must be a positive integer")
+    if thinking == "auto" and budget is not None:
+        raise SchemaError(f'thinking_budget for {name!r} cannot be set with thinking: "auto", '
+                          "which picks the effort itself")
+    if "thinking_effort" not in field:
+        return thinking, budget
+    effort = field["thinking_effort"]
+    if not isinstance(effort, str) or effort not in THINKING_EFFORTS:
+        raise SchemaError(f"thinking_effort for {name!r} must be one of {list(THINKING_EFFORTS)}")
+    if thinking == "auto":
+        raise SchemaError(f'thinking_effort for {name!r} cannot be set with thinking: "auto", '
+                          "which picks the effort itself")
+    if budget is not None:
+        raise SchemaError(f"thinking_effort and thinking_budget for {name!r} both set the budget; use one")
+    thinks = effort != "none"
+    if thinking is not None and thinking != thinks:
+        raise SchemaError(f"thinking: {str(thinking).lower()} for {name!r} contradicts thinking_effort {effort!r}")
+    return thinks, THINKING_EFFORTS[effort]
 
 
 def dependency_layers(decisions: Sequence) -> list[list]:

@@ -263,8 +263,28 @@ and moves on to the typed answer.
 `response.thinking` maps each field that thought to its reasoning, and
 `response.usage.thinking_tokens` counts the reasoning tokens.
 
-Models with always-on thinking reason on every field; `thinking_budget` applies
-to them too. See [Supported models](#supported-models).
+### Thinking effort
+
+`thinking_effort` sets the budget by level instead: `"none"` does not think,
+`"low"` thinks up to 512 tokens, `"medium"` up to 2048 and `"high"` up to 4096.
+
+With `"thinking": "auto"`, TypeLLM picks the level on each call. It first asks
+the model how much reasoning the field needs, without thinking, then answers the
+field at that level. The field's own prompt is unchanged, and
+`response.thinking_effort` reports the level each `"auto"` field got:
+
+```python
+response = client.generate(context=context, questions={
+    "category": {"type": "string", "enum": ["meal", "travel", "equipment"]},
+    "policy_ok": {"type": "boolean", "instructions": "Does it meet the travel policy?",
+                  "thinking": "auto"},
+})
+response.thinking_effort  # {"policy_ok": "low"}
+```
+
+`"auto"` adds one quick step after the field's dependencies and before the field;
+that step sees the same dependency results. `thinking_effort` and
+`thinking_budget` cannot be combined with `"auto"` or with each other.
 
 ## Image input
 
@@ -471,9 +491,6 @@ server.
 | --- | --- |
 | `Qwen/Qwen3.8-27B` | On / off |
 | `Qwen/Qwen3.5-0.8B/4B/9B` | On / off |
-| `openbmb/MiniCPM5-1B` | On / off |
-| `inclusionAI/Ling-mini-2.0` | Off only |
-| `inclusionAI/Ring-mini-2.0` | Always on |
 
 Other sizes in the Qwen3.5 and Qwen3.8 families are expected to be compatible.
 
