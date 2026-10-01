@@ -1,0 +1,28 @@
+{
+  "calls": 17,
+  "errors": 0,
+  "think_ok": "17/17",
+  "answer_ok": "13/14",
+  "auto_levels": {
+    "name": [
+      "none",
+      "none",
+      "none"
+    ],
+    "shipped": [
+      "none",
+      "none",
+      "none"
+    ],
+    "total": [
+      "medium",
+      "medium",
+      "medium"
+    ],
+    "puzzle": [
+      "high",
+      "high",
+      "high"
+    ]
+  }
+}

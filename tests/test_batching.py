@@ -190,6 +190,111 @@ class PerFieldThinkingTests(unittest.TestCase):
                     {"type": "object", "properties": {"x": field}})
 
 
+class EffortServer(FakeServer):
+    """A FakeServer whose hidden effort questions answer self.level."""
+
+    LEVELS = ["none", "low", "medium", "high"]
+
+    def __init__(self, level):
+        super().__init__()
+        self.level = level
+
+    def _request(self, path, payload=None, *, allow_text=False):
+        response = super()._request(path, payload, allow_text=allow_text)
+        if path == "/generate" and "token_ids_logprob" in payload:
+            texts = [payload["text"]] if isinstance(payload["text"], str) else payload["text"]
+            rows = payload["token_ids_logprob"]
+            rows = [rows] if isinstance(rows[0], int) else rows
+            out = response if isinstance(response, list) else [response]
+            for text, ids, item in zip(texts, rows, out):
+                tail = text[text.rindex("Field:"):]  # the question being answered, not the history
+                if ".thinking_effort" in tail:
+                    pick = ids[self.LEVELS.index(self.level)]
+                    item["meta_info"]["output_token_ids_logprobs"] = [
+                        [[0.0 if t == pick else -9.0, t, "?"] for t in ids]]
+        return response
+
+
+class ThinkingEffortTests(unittest.TestCase):
+    def run_questions(self, questions, level="none"):
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
+        client.sglang = EffortServer(level)
+        done = client.generate(context="Board", questions=questions)
+        think = [(t, params["max_new_tokens"]) for p in client.sglang.requests("think")
+                 for t, params in zip([p["text"]] if isinstance(p["text"], str) else p["text"],
+                                      p["sampling_params"] if isinstance(p["sampling_params"], list)
+                                      else [p["sampling_params"]])]
+        return client, done, think
+
+    def test_each_effort_sets_a_budget_and_none_does_not_think(self):
+        for effort, budget in (("low", 512), ("medium", 2048), ("high", 4096)):
+            with self.subTest(effort=effort):
+                _, done, think = self.run_questions(
+                    {"x": {"type": "boolean", "instructions": "X?", "thinking_effort": effort}})
+                self.assertEqual([b for _, b in think], [budget])
+                self.assertEqual(set(done.thinking), {"x"})
+                self.assertEqual(done.thinking_effort, {})  # only "auto" reports its pick
+        _, done, think = self.run_questions({"x": {"type": "boolean", "thinking_effort": "none"}})
+        self.assertEqual((think, done.thinking), ([], {}))
+
+    def test_auto_thinks_with_the_budget_of_the_effort_it_picks(self):
+        for level, budget in (("low", 512), ("medium", 2048), ("high", 4096)):
+            with self.subTest(level=level):
+                _, done, think = self.run_questions(
+                    {"x": {"type": "boolean", "instructions": "X?", "thinking": "auto"}}, level)
+                self.assertEqual(done.result, {"x": True})
+                self.assertEqual(done.thinking_effort, {"x": level})
+                self.assertEqual(set(done.thinking), {"x"})
+                [(text, used)] = think  # the effort question itself never thinks
+                self.assertEqual(used, budget)
+                self.assertNotIn("thinking_effort", text)
+
+    def test_auto_none_answers_like_a_field_without_thinking(self):
+        client, done, think = self.run_questions({"x": {"type": "boolean", "thinking": "auto"}}, "none")
+        self.assertEqual((done.result, done.thinking_effort, think), ({"x": True}, {"x": "none"}, []))
+        plain, _, _ = self.run_questions({"x": {"type": "boolean"}})
+        # The field's own prompt does not mention the hidden question.
+        self.assertEqual(client._last_prompts.get()[-1], plain._last_prompts.get()[-1])
+
+    def test_effort_question_sees_dependencies_but_dependents_never_see_it(self):
+        client, done, _ = self.run_questions({
+            "risk": {"type": "string", "enum": ["low", "high"]},
+            "x": {"type": "boolean", "depends_on": ["risk"], "thinking": "auto"},
+            "y": {"type": "boolean", "depends_on": ["x"]},
+        }, "high")
+        self.assertEqual(list(done.result), ["risk", "x", "y"])
+        self.assertEqual(done.thinking_effort, {"x": "high"})
+        prompts = dict(zip(["risk", "x.thinking_effort", "x", "y"], client._last_prompts.get()))
+        self.assertIn('"risk": "low"', prompts["x.thinking_effort"])
+        self.assertNotIn("thinking_effort", prompts["x"])
+        self.assertNotIn("thinking_effort", prompts["y"])
+
+    def test_effort_question_shows_the_fields_type_and_choices(self):
+        client, _, _ = self.run_questions({"x": {"type": "string", "enum": ["approve", "reject"],
+                                                 "instructions": "Decide.", "thinking": "auto"}})
+        effort_prompt = client._last_prompts.get()[0]
+        self.assertIn('Type: choice\nInstructions: Decide.\nChoices: ["approve", "reject"]', effort_prompt)
+
+    def test_invalid_settings_are_schema_errors(self):
+        from typellm import SchemaError
+        for questions in (
+            {"x": {"type": "boolean", "thinking": "auto", "thinking_budget": 100}},
+            {"x": {"type": "boolean", "thinking": "auto", "thinking_effort": "low"}},
+            {"x": {"type": "boolean", "thinking_effort": "low", "thinking_budget": 100}},
+            {"x": {"type": "boolean", "thinking_effort": "max"}},
+            {"x": {"type": "boolean", "thinking_effort": None}},
+            {"x": {"type": "boolean", "thinking": True, "thinking_effort": "none"}},
+            {"x": {"type": "boolean", "thinking": False, "thinking_effort": "high"}},
+            {"x": {"type": "boolean", "thinking": "yes"}},
+            {"x": {"type": "boolean", "thinking": "auto"}, "x.thinking_effort": {"type": "boolean"}},
+            {"x": {"type": "boolean", "thinking": "auto"},
+             "y": {"type": "boolean", "depends_on": ["x.thinking_effort"]}},
+        ):
+            with self.subTest(questions=questions), self.assertRaises(SchemaError):
+                TypeLLMClient("http://127.0.0.1:30000", model="fake").compile_schema(
+                    {"type": "object", "properties": questions})
+
+
 class BatchedThinkingTests(unittest.TestCase):
     QUESTIONS = {
         "flag": {"type": "boolean"},

@@ -12,7 +12,7 @@ import time
 import warnings
 from contextlib import nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import permutations as all_permutations
 from string import ascii_uppercase, digits
 from typing import Any, Mapping, Sequence
@@ -21,6 +21,7 @@ import httpx
 
 from .schema import (
     MAX_ENUM_CHOICES,
+    THINKING_EFFORTS,
     SchemaError,
     compile_json_schema,
     dependency_layers,
@@ -67,6 +68,8 @@ class Choice:
     nullable: bool = False
     thinking: bool | None = None
     thinking_budget: int | None = None
+    effort_from: str | None = None
+    effort_for: str | None = None
 
     def __post_init__(self) -> None:
         if not self.choices and self.numeric_type is None and not self.text_type:
@@ -139,11 +142,13 @@ class Choice:
 @dataclass(frozen=True)
 class Generation:
     """What generate() returns, as the HTTP API does: the typed answers, the
-    reasoning of each field that thought, and the tokens of the call."""
+    reasoning of each field that thought, the tokens of the call, and the effort
+    each thinking: "auto" field was given."""
 
     result: dict[str, Any]
     thinking: dict[str, str]
     usage: Usage
+    thinking_effort: dict[str, str] = field(default_factory=dict)
 
 
 class TypeLLMClient:
@@ -316,6 +321,8 @@ class TypeLLMClient:
                     nullable=item.nullable,
                     thinking=item.thinking,
                     thinking_budget=item.thinking_budget,
+                    effort_from=item.effort_from,
+                    effort_for=item.effort_for,
                 )
                 for item in decisions
             ]
@@ -477,10 +484,14 @@ class TypeLLMClient:
         self._last_prompts.set(prompts)
         thinking = {decision.name: row["thinking"] for decision, row in zip(decisions, rows)
                     if row.get("thinking")}
+        effort = {decision.effort_for: row["value"] for decision, row in zip(decisions, rows)
+                  if decision.effort_for is not None}
 
         output: dict[str, Any] = {}
         for decision, row in zip(decisions, rows):
             assert decision.name is not None
+            if decision.effort_for is not None:  # a hidden effort question, not the caller's
+                continue
             value = row["value"]
             if decision.return_probabilities:
                 probabilities = {
@@ -496,7 +507,7 @@ class TypeLLMClient:
 
         if print_final_prompt:
             _print_final_prompts(prompts)
-        return Generation(output, thinking, scope.usage)
+        return Generation(output, thinking, scope.usage, effort)
 
     def _generate_hosted(self, context: str, questions: Mapping[str, Any], images: Sequence[str],
                          mode: str, temperature: float, seed: int | None,
@@ -536,6 +547,7 @@ class TypeLLMClient:
             usage = data["usage"]
             result = data["result"]
             thinking = data.get("thinking") or {}
+            effort = data.get("thinking_effort") or {}
             input_tokens = usage["input_tokens"]
             thinking_tokens = usage["thinking_tokens"]
             # JSON keys are strings: key probabilities by each field's values again, as locally.
@@ -551,7 +563,8 @@ class TypeLLMClient:
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             raise SGLangError("TypeLLM API returned an invalid response",
                               status=response.status_code) from exc
-        return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens))
+        return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens),
+                          effort)
 
     def _http(self) -> httpx.Client:
         with self._http_lock:
@@ -791,15 +804,20 @@ def _execute_dependency_decisions(
     rows_by_name = {}
     prompts_by_name = {}
     ancestors = {}
+    hidden = {d.name for d in decisions if d.effort_for is not None}
     for layer in dependency_layers(decisions):
         dependency_values = {}
         parent_prefixes = {}
+        settled = []
         for decision in layer:
             visible = set(decision.depends_on or ())
             for name in decision.depends_on or ():
                 visible.update(ancestors[name])
             ancestors[decision.name] = visible
-            parents = decision.depends_on or ()
+            # An effort question is invisible to the field it serves: the field's
+            # prompt is the one it would have without thinking: "auto".
+            visible -= hidden
+            parents = [name for name in decision.depends_on or () if name not in hidden]
             if parents:
                 # Longest serialized prefix is a deterministic heuristic; KV
                 # from distinct branches cannot be concatenated.
@@ -809,6 +827,11 @@ def _execute_dependency_decisions(
                 d.name: rows_by_name[d.name]["value"]
                 for d in decisions if d.name in visible
             }
+            if decision.effort_from is not None:
+                budget = THINKING_EFFORTS[rows_by_name[decision.effort_from]["value"]]
+                decision = replace(decision, thinking=budget is not None, thinking_budget=budget)
+            settled.append(decision)
+        layer = settled
         rows, prompts = _execute_batch_decisions(
             client, context, layer, mode, temperature, rng, numeric_max_digits,
             dependency_values=dependency_values,
