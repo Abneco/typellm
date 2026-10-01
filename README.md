@@ -15,7 +15,9 @@
 </div>
 
 ## Updates
-- **[2026/09/29]** The [TypeLLM API](https://typellm.ai) is live: typed outputs without serving a model yourself, and $5 of credit for new accounts. [Get early access](https://typellm.ai/early-access) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
+- 🚀 **The [TypeLLM API](https://typellm.ai) is live**: typed outputs without serving a model yourself, and $5 of credit for new accounts. [Get early access](https://typellm.ai/early-access) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
+- **[2026/10/01]** Added [conditional fields](#conditional-fields): `when` runs a field only when its dependencies' answers pass tests such as `{"amount": {"gte": 1000}}`.
+- **[2026/10/01]** Added [thinking effort](#thinking-effort): set thinking by level, or let `"thinking": "auto"` choose it on each call.
 - **[2026/09/24]** Added [image input](#image-input) for vision-language models, tested with Qwen3.8-27B.
 - **[2026/09/23]** Added [JevBench results](https://github.com/TypeLLM/TypeLLM/blob/main/evals/jevbench/README.md): TypeLLM scored 195/231 without thinking and 228/231 with thinking.
 - **[2026/09/23]** Added [permutation averaging](#per-question-permutation-averaging) to improve the predictive distribution. See the [blog post](https://typellm.ai/blog/fair-die).
@@ -344,6 +346,50 @@ This runs `system`, then `severity` and `deployment_related`, then `rollback`.
 A field sees the results of its direct and transitive dependencies, and each
 step reuses its parent's cached prompt. Unknown names and cycles raise
 `SchemaError`.
+
+### Conditional fields
+
+`when` runs a field only for some answers of its dependencies:
+
+```python
+response = client.generate(context=ticket, questions={
+    "category": {"type": "string", "enum": ["bug", "incident", "feature_request"]},
+    "severity": {
+        "type": "string",
+        "enum": ["low", "medium", "high"],
+        "depends_on": ["category"],
+        "when": {"category": ["bug", "incident"]},
+    },
+    "page_on_call": {"type": "boolean", "depends_on": ["severity"]},
+})
+# A feature request:
+response.result   # {"category": "feature_request"}
+response.skipped  # ["severity", "page_on_call"]
+```
+
+`when` maps fields in `depends_on` to a test of their answers:
+
+```python
+"when": {"category": "bug"}                            # equals
+"when": {"category": ["bug", "incident"]}              # one of; also {"in": [...]}
+"when": {"category": {"not_in": ["feature_request"]}}  # none of
+"when": {"quantity": {"ne": 0}}                        # not equal
+"when": {"amount": {"gte": 1000}}                      # gt, gte, lt and lte compare numbers
+"when": {"score": {"gt": 0, "lte": 60}}                # several tests: all must pass
+"when": {"tip": {"ne": None}}                          # not null
+```
+
+With several fields, every test must pass. Values are checked against the
+field's type: an enum value, `True` or `False`, a number, or `None` for a
+nullable field. `gt`, `gte`, `lt` and `lte` work on number fields only, and a
+`None` answer fails them. Text fields cannot be tested, except for `None`.
+These tests run in code on the typed answers, so they add no requests.
+
+A skipped field is not run and has no key in `result`, even if a JSON Schema
+`required` lists it; `response.skipped` lists it. Fields that depend on a
+skipped field are skipped too, even when their other dependencies ran. A skipped
+field sends no requests; only its definition counts toward the call's input
+tokens.
 
 ## Probabilities and sampling
 

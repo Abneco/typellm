@@ -24,6 +24,7 @@ from .schema import (
     THINKING_EFFORTS,
     SchemaError,
     compile_json_schema,
+    condition_met,
     dependency_layers,
 )
 from .images import encode_images
@@ -70,6 +71,7 @@ class Choice:
     thinking_budget: int | None = None
     effort_from: str | None = None
     effort_for: str | None = None
+    when: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.choices and self.numeric_type is None and not self.text_type:
@@ -142,13 +144,15 @@ class Choice:
 @dataclass(frozen=True)
 class Generation:
     """What generate() returns, as the HTTP API does: the typed answers, the
-    reasoning of each field that thought, the tokens of the call, and the effort
-    each thinking: "auto" field was given."""
+    reasoning of each field that thought, the tokens of the call, the effort
+    each thinking: "auto" field was given, and the fields a "when" skipped,
+    which have no answer in result."""
 
     result: dict[str, Any]
     thinking: dict[str, str]
     usage: Usage
     thinking_effort: dict[str, str] = field(default_factory=dict)
+    skipped: list[str] = field(default_factory=list)
 
 
 class TypeLLMClient:
@@ -323,6 +327,7 @@ class TypeLLMClient:
                     thinking_budget=item.thinking_budget,
                     effort_from=item.effort_from,
                     effort_for=item.effort_for,
+                    when=item.when,
                 )
                 for item in decisions
             ]
@@ -481,16 +486,19 @@ class TypeLLMClient:
             except BaseException as exc:
                 exc.usage = scope.usage  # partial work, for callers that bill it
                 raise
-        self._last_prompts.set(prompts)
+        # A field a "when" skipped has no row and no prompt.
+        self._last_prompts.set([prompt for prompt in prompts if prompt is not None])
+        skipped = [decision.name for decision, row in zip(decisions, rows)
+                   if row is None and decision.effort_for is None]
         thinking = {decision.name: row["thinking"] for decision, row in zip(decisions, rows)
-                    if row.get("thinking")}
+                    if row is not None and row.get("thinking")}
         effort = {decision.effort_for: row["value"] for decision, row in zip(decisions, rows)
-                  if decision.effort_for is not None}
+                  if decision.effort_for is not None and row is not None}
 
         output: dict[str, Any] = {}
         for decision, row in zip(decisions, rows):
             assert decision.name is not None
-            if decision.effort_for is not None:  # a hidden effort question, not the caller's
+            if decision.effort_for is not None or row is None:  # a hidden effort question, or skipped
                 continue
             value = row["value"]
             if decision.return_probabilities:
@@ -506,8 +514,8 @@ class TypeLLMClient:
                 output[decision.name] = value
 
         if print_final_prompt:
-            _print_final_prompts(prompts)
-        return Generation(output, thinking, scope.usage, effort)
+            _print_final_prompts(self._last_prompts.get())
+        return Generation(output, thinking, scope.usage, effort, skipped)
 
     def _generate_hosted(self, context: str, questions: Mapping[str, Any], images: Sequence[str],
                          mode: str, temperature: float, seed: int | None,
@@ -548,6 +556,7 @@ class TypeLLMClient:
             result = data["result"]
             thinking = data.get("thinking") or {}
             effort = data.get("thinking_effort") or {}
+            skipped = data.get("skipped") or []
             input_tokens = usage["input_tokens"]
             thinking_tokens = usage["thinking_tokens"]
             # JSON keys are strings: key probabilities by each field's values again, as locally.
@@ -564,7 +573,7 @@ class TypeLLMClient:
             raise SGLangError("TypeLLM API returned an invalid response",
                               status=response.status_code) from exc
         return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens),
-                          effort)
+                          effort, skipped)
 
     def _http(self) -> httpx.Client:
         with self._http_lock:
@@ -810,6 +819,13 @@ def _execute_dependency_decisions(
         parent_prefixes = {}
         settled = []
         for decision in layer:
+            # Skipped: a dependency was skipped, so its answer does not exist, or the
+            # field's "when" does not match. Either way nothing is sent for it.
+            if any(rows_by_name[name] is None for name in decision.depends_on or ()) or (
+                    decision.when is not None and not condition_met(
+                        decision, {name: rows_by_name[name]["value"] for name, _ in decision.when})):
+                rows_by_name[decision.name] = prompts_by_name[decision.name] = None
+                continue
             visible = set(decision.depends_on or ())
             for name in decision.depends_on or ():
                 visible.update(ancestors[name])
@@ -832,6 +848,8 @@ def _execute_dependency_decisions(
                 decision = replace(decision, thinking=budget is not None, thinking_budget=budget)
             settled.append(decision)
         layer = settled
+        if not layer:
+            continue
         rows, prompts = _execute_batch_decisions(
             client, context, layer, mode, temperature, rng, numeric_max_digits,
             dependency_values=dependency_values,
