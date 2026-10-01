@@ -286,9 +286,6 @@ response.thinking_effort  # {"policy_ok": "low"}
 that step sees the same dependency results. `thinking_effort` and
 `thinking_budget` cannot be combined with `"auto"` or with each other.
 
-Models with always-on thinking reason on every field; `thinking_budget` applies
-to them too. See [Supported models](#supported-models).
-
 ## Image input
 
 Pass images with `images=` alongside the text context. The served model must be
@@ -494,9 +491,6 @@ server.
 | --- | --- |
 | `Qwen/Qwen3.8-27B` | On / off |
 | `Qwen/Qwen3.5-0.8B/4B/9B` | On / off |
-| `openbmb/MiniCPM5-1B` | On / off |
-| `inclusionAI/Ling-mini-2.0` | Off only |
-| `inclusionAI/Ring-mini-2.0` | Always on |
 
 Other sizes in the Qwen3.5 and Qwen3.8 families are expected to be compatible.
 
