@@ -37,6 +37,9 @@ class Decision:
     # effort_from on the field names that question, effort_for on it names the field.
     effort_from: str | None = None
     effort_for: str | None = None
+    # "when": run only if every named dependency's answer passes its tests;
+    # kept as ((field, ((operator, operand), ...)), ...). A skipped field skips its dependents too.
+    when: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] | None = None
 
 
 # thinking_effort levels and their budgets; "none" does not think.
@@ -67,18 +70,17 @@ def _describe(decision: Decision) -> str:
     return "\n".join(lines)
 
 
+def _same_value(a: Any, b: Any) -> bool:
+    """JSON equality: 1 and 1.0 match, true and 1 do not."""
+    if type(a) in {int, float} and type(b) in {int, float}:
+        return a == b
+    return type(a) is type(b) and a == b
+
+
 def _has_duplicates(values: Sequence[Any]) -> bool:
     for index, value in enumerate(values):
-        for previous in values[:index]:
-            # JSON booleans are distinct from numbers, while 1 and 1.0 denote
-            # the same JSON numeric value.
-            both_numbers = (
-                type(value) in {int, float} and type(previous) in {int, float}
-            )
-            if (both_numbers and value == previous) or (
-                type(value) is type(previous) and value == previous
-            ):
-                return True
+        if any(_same_value(value, previous) for previous in values[:index]):
+            return True
     return False
 
 
@@ -242,6 +244,7 @@ def compile_json_schema(schema: Mapping[str, Any]) -> list[Decision]:
                      permutations=permutations, nullable=nullable)
         )
 
+    by_name = {decision.name: decision for decision in decisions}
     compiled = []
     for decision in decisions:
         field = properties[decision.name]
@@ -258,20 +261,110 @@ def compile_json_schema(schema: Mapping[str, Any]) -> list[Decision]:
                 if dependency not in properties:
                     raise SchemaError(f"unknown dependency {dependency!r} for {decision.name!r}")
             dependencies = tuple(dependencies)
+        when = _condition(decision.name, field, dependencies, by_name) if "when" in field else None
         thinking, budget = _thinking_settings(decision.name, field)
         if thinking == "auto":
             effort = f"{decision.name}.thinking_effort"
             if effort in properties:
                 raise SchemaError(f"field name {effort!r} is taken by thinking: \"auto\" on {decision.name!r}")
             # Asked with the field's own dependencies, never thinks, and runs one layer before it.
+            # The effort question shares the field's condition: a skipped field asks nothing.
             compiled.append(Decision(effort, EFFORT_QUESTION.format(question=_describe(decision)),
                                      tuple(THINKING_EFFORTS), depends_on=dependencies, thinking=False,
-                                     effort_for=decision.name))
-            compiled.append(replace(decision, depends_on=(dependencies or ()) + (effort,), effort_from=effort))
+                                     effort_for=decision.name, when=when))
+            compiled.append(replace(decision, depends_on=(dependencies or ()) + (effort,), effort_from=effort,
+                                    when=when))
             continue
-        compiled.append(replace(decision, depends_on=dependencies, thinking=thinking, thinking_budget=budget))
+        compiled.append(replace(decision, depends_on=dependencies, thinking=thinking, thinking_budget=budget,
+                                when=when))
     dependency_layers(compiled)
     return compiled
+
+
+# "when" operators. A bare value means {"in": [value]}, and a list {"in": list}.
+COMPARISONS = {"gt": lambda a, b: a > b, "gte": lambda a, b: a >= b,
+               "lt": lambda a, b: a < b, "lte": lambda a, b: a <= b}
+OPERATORS = ("in", "not_in", "ne", *COMPARISONS)
+
+
+def _numeric(decision: Decision) -> bool:
+    """An integer or number field, open or with a numeric enum."""
+    if decision.numeric_type is not None:
+        return True
+    values = [value for value in decision.choices if value is not None]
+    return decision.syntax == "Choice" and bool(values) and all(_is_finite_number(v) for v in values)
+
+
+def _can_answer(decision: Decision, value: Any) -> bool:
+    """Whether the field can give this answer, so a condition on it can ever hold."""
+    if decision.choices:
+        return any(_same_value(value, choice) for choice in decision.choices)
+    if value is None:
+        return decision.nullable
+    if decision.numeric_type == "integer":
+        return _is_finite_number(value) and float(value).is_integer()
+    return decision.numeric_type is not None and _is_finite_number(value)
+
+
+def _condition(name: str, field: Mapping[str, Any], dependencies: tuple[str, ...] | None,
+               by_name: Mapping[str, Decision]) -> tuple:
+    """A field's "when" as ((field, ((operator, operand), ...)), ...), checked before anything runs.
+
+    It may name only fields listed in depends_on. Equality tests (a value, a list,
+    in, not_in, ne) take answers the field can give: an enum value, true or false, a
+    number, or null for a nullable field. gt, gte, lt and lte take numbers, on number
+    fields. Open text fields cannot be conditions, except for null.
+    """
+    when = field["when"]
+    if not isinstance(when, Mapping) or not when:
+        raise SchemaError(f"when for {name!r} must map dependencies to the answers that run it")
+    condition = []
+    for parent, test in when.items():
+        if parent not in (dependencies or ()):
+            raise SchemaError(f"when for {name!r} names {parent!r}, which is not in its depends_on")
+        source = by_name[parent]
+        if not isinstance(test, Mapping):
+            test = {"in": test if isinstance(test, list) else [test]}
+        if not test:
+            raise SchemaError(f"when for {name!r} has no test for {parent!r}")
+        tests = []
+        for operator, operand in test.items():
+            if operator not in OPERATORS:
+                raise SchemaError(f"when for {name!r}: unknown operator {operator!r} on {parent!r}; "
+                                  f"use one of {list(OPERATORS)}")
+            if operator in COMPARISONS:
+                if not _numeric(source):
+                    raise SchemaError(f"when for {name!r}: {operator} needs a number field, and {parent!r} is not")
+                if not _is_finite_number(operand):
+                    raise SchemaError(f"when for {name!r}: {operator} on {parent!r} must be a number")
+            else:
+                if operator in ("in", "not_in"):
+                    if not isinstance(operand, list) or not operand:
+                        raise SchemaError(f"when for {name!r}: {operator} on {parent!r} must be a non-empty list")
+                    operand = tuple(operand)
+                for value in operand if operator != "ne" else (operand,):
+                    if not _can_answer(source, value):
+                        raise SchemaError(f"when for {name!r}: {value!r} is not an answer {parent!r} can give")
+            tests.append((operator, operand))
+        condition.append((parent, tuple(tests)))
+    return tuple(condition)
+
+
+def _passes(operator: str, operand: Any, answer: Any) -> bool:
+    if operator == "in":
+        return any(_same_value(answer, value) for value in operand)
+    if operator == "not_in":
+        return not any(_same_value(answer, value) for value in operand)
+    if operator == "ne":
+        return not _same_value(answer, operand)
+    # A comparison holds only for a number: null, for one, is not above or below anything.
+    return _is_finite_number(answer) and COMPARISONS[operator](answer, operand)
+
+
+def condition_met(decision: Any, answers: Mapping[str, Any]) -> bool:
+    """Whether a decision with a "when" runs, given its dependencies' answers."""
+    return all(_passes(operator, operand, answers[parent])
+               for parent, tests in decision.when for operator, operand in tests)
 
 
 def _thinking_settings(name: str, field: Mapping[str, Any]) -> tuple[bool | str | None, int | None]:
