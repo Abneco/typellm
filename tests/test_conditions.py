@@ -92,8 +92,8 @@ class ConditionalFieldTests(unittest.TestCase):
     def test_invalid_conditions_are_schema_errors(self):
         category = {"type": "string", "enum": ["bug", "incident"]}
         for field in (
-            {"type": "boolean", "when": {"category": "bug"}},                            # no depends_on
-            {"type": "boolean", "depends_on": ["category"], "when": {"other": True}},    # not a dependency
+            {"type": "boolean", "when": {"missing": True}},                              # not a field
+            {"type": "boolean", "when": {"x": True}},                                    # itself
             {"type": "boolean", "depends_on": ["category"], "when": {}},
             {"type": "boolean", "depends_on": ["category"], "when": ["category"]},
             {"type": "boolean", "depends_on": ["category"], "when": {"category": []}},
@@ -121,6 +121,19 @@ class ConditionalFieldTests(unittest.TestCase):
                         "category": category, "other": {"type": "boolean"}, "flag": {"type": "boolean"},
                         "count": {"type": "integer"}, "text": {"type": "string"}, "x": field}})
 
+
+    def test_fields_a_condition_names_become_dependencies(self):
+        done, sent = self.run_questions({
+            "category": {"type": "string", "enum": TRIAGE},
+            "urgent": {"type": "boolean"},
+            "severity": {"type": "string", "enum": ["low", "high"], "when": {"category": "bug"}},
+            "reply": {"type": "boolean", "depends_on": ["urgent"], "when": {"category": "feature_request"}},
+        })
+        self.assertEqual(done.result, {"category": "feature_request", "urgent": True, "reply": True})
+        self.assertEqual(done.skipped, ["severity"])
+        reply = [t for t in sent if 'Field: "reply"' in t][-1]
+        self.assertIn('"category": "feature_request"', reply)  # it sees the answer it waited for
+        self.assertIn('"urgent": true', reply)
 
     def test_operators(self):
         # The fake answers: category "bug", amount 7 (an open number), level 2, tip null.

@@ -261,7 +261,13 @@ def compile_json_schema(schema: Mapping[str, Any]) -> list[Decision]:
                 if dependency not in properties:
                     raise SchemaError(f"unknown dependency {dependency!r} for {decision.name!r}")
             dependencies = tuple(dependencies)
-        when = _condition(decision.name, field, dependencies, by_name) if "when" in field else None
+        when = None
+        if "when" in field:
+            when = _condition(decision.name, field, by_name)
+            # A field waits for the answers its "when" tests: they become dependencies.
+            added = tuple(parent for parent, _ in when if parent not in (dependencies or ()))
+            if added:
+                dependencies = (dependencies or ()) + added
         thinking, budget = _thinking_settings(decision.name, field)
         if thinking == "auto":
             effort = f"{decision.name}.thinking_effort"
@@ -306,11 +312,10 @@ def _can_answer(decision: Decision, value: Any) -> bool:
     return decision.numeric_type is not None and _is_finite_number(value)
 
 
-def _condition(name: str, field: Mapping[str, Any], dependencies: tuple[str, ...] | None,
-               by_name: Mapping[str, Decision]) -> tuple:
+def _condition(name: str, field: Mapping[str, Any], by_name: Mapping[str, Decision]) -> tuple:
     """A field's "when" as ((field, ((operator, operand), ...)), ...), checked before anything runs.
 
-    It may name only fields listed in depends_on. Equality tests (a value, a list,
+    The fields it names become dependencies if depends_on leaves them out. Equality tests (a value, a list,
     in, not_in, ne) take answers the field can give: an enum value, true or false, a
     number, or null for a nullable field. gt, gte, lt and lte take numbers, on number
     fields. Open text fields cannot be conditions, except for null.
@@ -320,8 +325,8 @@ def _condition(name: str, field: Mapping[str, Any], dependencies: tuple[str, ...
         raise SchemaError(f"when for {name!r} must map dependencies to the answers that run it")
     condition = []
     for parent, test in when.items():
-        if parent not in (dependencies or ()):
-            raise SchemaError(f"when for {name!r} names {parent!r}, which is not in its depends_on")
+        if parent not in by_name:
+            raise SchemaError(f"when for {name!r} names {parent!r}, which is not a field")
         source = by_name[parent]
         if not isinstance(test, Mapping):
             test = {"in": test if isinstance(test, list) else [test]}
