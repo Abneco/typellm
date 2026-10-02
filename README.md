@@ -357,7 +357,6 @@ response = client.generate(context=ticket, questions={
     "severity": {
         "type": "string",
         "enum": ["low", "medium", "high"],
-        "depends_on": ["category"],
         "when": {"category": ["bug", "incident"]},
     },
     "page_on_call": {"type": "boolean", "depends_on": ["severity"]},
@@ -367,7 +366,9 @@ response.result   # {"category": "feature_request"}
 response.skipped  # ["severity", "page_on_call"]
 ```
 
-`when` maps fields in `depends_on` to a test of their answers:
+`when` maps other fields to a test of their answers. The fields it names are
+dependencies, whether or not `depends_on` lists them, so the field also sees
+their answers:
 
 ```python
 "when": {"category": "bug"}                            # equals
