@@ -15,7 +15,7 @@
 </div>
 
 ## Updates
-- 🚀 **The [TypeLLM API](https://typellm.ai) is live**: typed outputs without serving a model yourself, and $5 of credit for new accounts. [Get early access](https://typellm.ai/early-access) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
+- 🚀 **The [TypeLLM API](https://typellm.ai) is live**: typed outputs without serving a model yourself, and $5 of credit for new accounts. [Try it](https://typellm.ai/dashboard/playground) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
 - **[2026/10/01]** Added [conditional fields](#conditional-fields): `when` runs a field only when its dependencies' answers pass tests such as `{"amount": {"gte": 1000}}`.
 - **[2026/10/01]** Added [thinking effort](#thinking-effort): set thinking by level, or let `"thinking": "auto"` choose it on each call.
 - **[2026/09/24]** Added [image input](#image-input) for vision-language models, tested with Qwen3.8-27B.
@@ -64,9 +64,8 @@ Both clients take the same requests.
 
 ### TypeLLM API (cloud)
 
-[Sign in](https://typellm.ai/login), enter your access code on the
-[API keys](https://typellm.ai/dashboard/keys) page and create a key. No code yet?
-[Get early access](https://typellm.ai/early-access).
+[Sign in](https://typellm.ai/login) and create a key on the
+[API keys](https://typellm.ai/dashboard/keys) page.
 
 ```bash
 export TYPELLM_API_KEY="tl-sk-..."
