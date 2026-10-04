@@ -32,7 +32,7 @@ TypeLLM brings type-safe generation to existing autoregressive LLMs without chan
 
 ### Supported output types
 
-**String · Integer · Number · Boolean · Enum choice** — See [schemas and examples](#output-types).
+**String · Integer · Number · Boolean · Enum choice · Object · Array** — See [schemas and examples](#output-types).
 
 ### Features
 
@@ -166,6 +166,8 @@ TypeLLM supports finite decisions, numeric fields, and free text:
 | Number | `{"type": "number"}` | `float` |
 | Boolean | `{"type": "boolean"}` | `bool` |
 | Enum choice | `{"type": "string", "enum": ["meal", "travel"]}` | Candidate type: `str`, `int`, or `float` |
+| Object | `{"type": "object", "properties": {...}}` | `dict` |
+| Array | `{"type": "array", "items": {...}}` | `list` |
 
 Enum choices support `string`, `integer`, and `number` types, with at most 24 values. The declared `type` validates the candidate values.
 
@@ -242,6 +244,63 @@ response = client.generate(
   lists `None`.
 - `return_probabilities` works for nullable booleans and enums, and its
   probabilities include `None`.
+
+### Objects and arrays
+
+`object` groups multiple typed properties into one structured value:
+
+```python
+"profile": {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "age": {"type": "integer"},
+    },
+}
+# {"profile": {"name": "Alice", "age": 32}}
+```
+
+`array` returns a variable number of typed items matching the `items` schema:
+
+```python
+"skills": {
+    "type": "array",
+    "items": {"type": "string"},
+    "instructions": "Return all relevant skills.",
+}
+# {"skills": ["Python", "CUDA", "PyTorch"]}
+```
+
+Items can be enum values, or objects:
+
+```python
+"employees": {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "role": {"type": "string"},
+        },
+    },
+    "instructions": "Return all employees.",
+}
+# {"employees": [{"name": "Ada", "role": "CTO"}, {"name": "Lin", "role": "Engineer"}]}
+```
+
+- A property takes what a field takes: `instructions`, `enum`, `thinking`, and
+  `depends_on` or `when` on other properties of the same object. Objects can
+  hold objects. A field that `depends_on` an object or an array sees all of it.
+- An item's properties are generated in the order they are declared, each seeing
+  the ones before it, so they all describe the same item: put first the property
+  that identifies it.
+- `minItems` and `maxItems` bound an array. An array holds at most 50 items,
+  each distinct from the others.
+- An object or an array can itself have `depends_on` and `when`; skipped, it is
+  listed once in `response.skipped`. A property a `when` skipped is listed by
+  its path, such as `"person.employer"`.
+- Not supported: arrays of arrays, arrays inside objects, `return_probabilities`
+  inside arrays, and `when` conditions that test an object or an array.
 
 ## Thinking mode
 

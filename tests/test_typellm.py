@@ -328,7 +328,7 @@ class JsonSchemaCompilerTests(unittest.TestCase):
             compile_json_schema(
                 {
                     "type": "object",
-                    "properties": {"x": {"type": "array"}},
+                    "properties": {"x": {"type": "date"}},
                 }
             )
 
