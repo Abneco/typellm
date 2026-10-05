@@ -101,8 +101,9 @@ class FakeServerClient(SGLangClient):
             return [{"meta_info": {"prompt_tokens": 900}} for _ in texts]
         ids = [ids] if isinstance(ids[0], int) else ids
         return [
-            {"meta_info": {"output_token_ids_logprobs": [[[0.0 if i == 0 else -5.0, t, chr(t)]
-                                                          for i, t in enumerate(row)]]}}
+            # Like SGLang, every reply counts its prompt; images are measured from the first one.
+            {"meta_info": {"prompt_tokens": 900, "output_token_ids_logprobs": [[[0.0 if i == 0 else -5.0, t, chr(t)]
+                                                                                for i, t in enumerate(row)]]}}
             for row in ids
         ]
 

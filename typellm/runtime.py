@@ -11,6 +11,7 @@ import threading
 import time
 import warnings
 from contextlib import nullcontext
+from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from itertools import permutations as all_permutations
@@ -20,8 +21,12 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from .schema import (
+    CONTINUE_FIELD,
+    CONTINUE_QUESTION,
+    MAX_ARRAY_ITEMS,
     MAX_ENUM_CHOICES,
     THINKING_EFFORTS,
+    ArrayField,
     SchemaError,
     compile_json_schema,
     condition_met,
@@ -72,6 +77,14 @@ class Choice:
     effort_from: str | None = None
     effort_for: str | None = None
     when: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] | None = None
+    # Where the answer goes in the result, ("person", "age"); empty means (name,).
+    path: tuple[str, ...] = ()
+    # The name the prompt shows ("age" for "person.age"); None shows name.
+    shown_name: str | None = None
+    # Lines the prompt shows before the field's own, such as the object it belongs to.
+    scope: str = ""
+    # depends_on grouped by what was named: a group is skipped only when all of it is.
+    dependency_groups: tuple[tuple[str, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.choices and self.numeric_type is None and not self.text_type:
@@ -91,29 +104,36 @@ class Choice:
             raise ValueError("Choice labels must be non-empty strings")
 
     @property
+    def field_name(self) -> str | None:
+        """The name the prompt and the answer use."""
+        return self.shown_name if self.shown_name is not None else self.name
+
+    @property
     def answer_prefill(self) -> str:
         """Start of the answer for open fields; the model continues with the value.
 
         Chat models tend to answer {"name": value}, so the value is decoded right
         where they would write it.
         """
-        if self.name is None or not (self.text_type or self.numeric_type is not None):
+        if self.field_name is None or not (self.text_type or self.numeric_type is not None):
             return ""
         # No trailing space: in {"name": 12} the space belongs to the value's first token.
-        return "{" + json.dumps(self.name, ensure_ascii=False) + ":"
+        return "{" + json.dumps(self.field_name, ensure_ascii=False) + ":"
 
     @property
     def label_prefill(self) -> str:
         """Start of a choice answer, {"name": "; the next token is the label."""
-        if self.name is None or self.text_type or self.numeric_type is not None:
+        if self.field_name is None or self.text_type or self.numeric_type is not None:
             return ""
-        return "{" + json.dumps(self.name, ensure_ascii=False) + ': "'
+        return "{" + json.dumps(self.field_name, ensure_ascii=False) + ': "'
 
     def opening_text(self) -> str:
-        """The field's prompt: the same Field / Type / Instructions / Answer lines for every type."""
-        lines = []
-        if self.name is not None:
-            lines.append(f"Field: {json.dumps(self.name, ensure_ascii=False)}")
+        """The field's prompt: the same Field / Type / Instructions / Answer lines for every type,
+        after the lines of its scope (the object it belongs to, the array item it is part of)."""
+        name = self.field_name
+        lines = self.scope.splitlines()
+        if name is not None:
+            lines.append(f"Field: {json.dumps(name, ensure_ascii=False)}")
         # A nullable field says "or null" in both its type and its answer: a bare
         # <number> reads as "a number is required" and pulls absent values to 0.
         or_null = " or null" if self.nullable else ""
@@ -127,18 +147,59 @@ class Choice:
         lines.append(f"Instructions: {self.question}")
         if self.text_type or self.numeric_type is not None:
             placeholder = "<string" + or_null + ">" if self.text_type else f"<{self.numeric_type}{or_null}>"
-            answer = (f"Answer as {{{json.dumps(self.name, ensure_ascii=False)}: {placeholder}}}."
-                      if self.name is not None else f"Answer with a JSON {placeholder[1:-1]} only.")
+            answer = (f"Answer as {{{json.dumps(name, ensure_ascii=False)}: {placeholder}}}."
+                      if name is not None else f"Answer with a JSON {placeholder[1:-1]} only.")
             if self.numeric_type == "number":
                 answer += " Do not use exponent notation."
             if self.nullable:
                 answer += " Return null only if there is no value."
         else:
             lines.append(f"Choices: {json.dumps(dict(self.choices), ensure_ascii=False)}")
-            answer = (f'Answer as {{{json.dumps(self.name, ensure_ascii=False)}: "<label>"}}.'
-                      if self.name is not None else "Answer with the best label only.")
+            answer = (f'Answer as {{{json.dumps(name, ensure_ascii=False)}: "<label>"}}.'
+                      if name is not None else "Answer with the best label only.")
         lines.append(answer)
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ArrayChoice:
+    """A runtime array: its item decisions with their labels bound, and its hidden continue question."""
+
+    name: str
+    question: str
+    items: tuple[Choice, ...]
+    item_object: bool
+    continue_choice: Choice
+    min_items: int = 0
+    # A scalar array's nullable items past minItems, null ending it; None asks continue_choice instead.
+    open_items: tuple[Choice, ...] | None = None
+    max_items: int | None = None
+    depends_on: tuple[str, ...] | None = None
+    when: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] | None = None
+    dependency_groups: tuple[tuple[str, ...], ...] | None = None
+    effort_for: None = None
+    effort_from: None = None
+    return_probabilities: bool = False
+
+    @property
+    def path(self) -> tuple[str, ...]:
+        return (self.name,)
+
+
+def _path(decision: Any) -> tuple[str, ...]:
+    return decision.path or (decision.name,)
+
+
+def _put(output: dict[str, Any], path: Sequence[str], value: Any) -> None:
+    """Set a value at its path, making the objects on the way in the order they are first set."""
+    for key in path[:-1]:
+        output = output.setdefault(key, {})
+    output[path[-1]] = value
+
+
+def _canonical_json(value: Any) -> str:
+    """The JSON an array's state commits: compact, keys in schema order, Unicode as is."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
 @dataclass(frozen=True)
@@ -298,8 +359,12 @@ class TypeLLMClient:
             "single-token labels were found for the current tokenizer"
         )
 
-    def compile_schema(self, schema: Mapping[str, Any]) -> list[Choice]:
-        """Compile standard JSON Schema or the original ordered-list format."""
+    def compile_schema(self, schema: Mapping[str, Any]) -> list[Choice | ArrayChoice]:
+        """Compile standard JSON Schema or the original ordered-list format.
+
+        An object's properties are Choices named by their path ("person.age"); an array is an
+        ArrayChoice.
+        """
         if self.api_key is not None:
             raise ValueError("compile_schema needs your own server when using api_key")
         if not isinstance(schema, Mapping):
@@ -309,10 +374,15 @@ class TypeLLMClient:
         properties = schema.get("properties")
         if isinstance(properties, Mapping):
             decisions = compile_json_schema(schema)
-            finite_sizes = [len(item.choices) for item in decisions if item.choices]
+            arrays = [item for item in decisions if isinstance(item, ArrayField)]
+            scalars = [item for item in decisions if not isinstance(item, ArrayField)]
+            scalars += [item for array in arrays for item in array.items + (array.open_items or ())]
+            # An array's continue question is a boolean: two labels.
+            finite_sizes = [len(item.choices) for item in scalars if item.choices] + [2] * bool(arrays)
             labels = self._control_labels(max(finite_sizes)) if finite_sizes else []
-            return [
-                Choice(
+
+            def bind(item):
+                return Choice(
                     question=item.question,
                     choices=dict(zip(labels, item.choices)),
                     name=item.name,
@@ -328,9 +398,29 @@ class TypeLLMClient:
                     effort_from=item.effort_from,
                     effort_for=item.effort_for,
                     when=item.when,
+                    path=item.path,
+                    shown_name=item.shown_name,
+                    scope=item.scope,
+                    dependency_groups=item.dependency_groups,
                 )
-                for item in decisions
-            ]
+
+            def bind_array(array):
+                return ArrayChoice(
+                    name=array.name,
+                    question=array.question,
+                    items=tuple(bind(item) for item in array.items),
+                    item_object=array.item_object,
+                    continue_choice=Choice(question=CONTINUE_QUESTION, choices=dict(zip(labels, (True, False))),
+                                           name=CONTINUE_FIELD, syntax="Bool", thinking=False),
+                    min_items=array.min_items,
+                    max_items=array.max_items,
+                    depends_on=array.depends_on,
+                    when=array.when,
+                    dependency_groups=array.dependency_groups,
+                    open_items=None if array.open_items is None else tuple(bind(item) for item in array.open_items),
+                )
+
+            return [bind_array(item) if isinstance(item, ArrayField) else bind(item) for item in decisions]
         if not isinstance(properties, list):
             raise SchemaError(
                 "schema.properties must be either an ordered JSON Schema object "
@@ -473,8 +563,9 @@ class TypeLLMClient:
                         context, json.dumps(questions if questions is not None else schema, ensure_ascii=False))))
                     scope.unmeasured_images = len(encoded_images)
                 # Independent fields run together; depends_on turns the fields into a
-                # graph whose layers run in order.
-                run = (_execute_dependency_decisions if any(d.depends_on is not None for d in decisions)
+                # graph whose layers run in order, and so do arrays, which take turns of their own.
+                run = (_execute_dependency_decisions
+                       if any(d.depends_on is not None or isinstance(d, ArrayChoice) for d in decisions)
                        else _execute_batch_decisions)
                 attach = self.sglang.images(encoded_images) if encoded_images else nullcontext()
                 with attach:
@@ -486,32 +577,11 @@ class TypeLLMClient:
             except BaseException as exc:
                 exc.usage = scope.usage  # partial work, for callers that bill it
                 raise
-        # A field a "when" skipped has no row and no prompt.
-        self._last_prompts.set([prompt for prompt in prompts if prompt is not None])
-        skipped = [decision.name for decision, row in zip(decisions, rows)
-                   if row is None and decision.effort_for is None]
-        thinking = {decision.name: row["thinking"] for decision, row in zip(decisions, rows)
-                    if row is not None and row.get("thinking")}
-        effort = {decision.effort_for: row["value"] for decision, row in zip(decisions, rows)
-                  if decision.effort_for is not None and row is not None}
-
-        output: dict[str, Any] = {}
-        for decision, row in zip(decisions, rows):
-            assert decision.name is not None
-            if decision.effort_for is not None or row is None:  # a hidden effort question, or skipped
-                continue
-            value = row["value"]
-            if decision.return_probabilities:
-                probabilities = {
-                    decision.choices[label]: probability
-                    for label, probability in row["probabilities"].items()
-                }
-                output[decision.name] = {
-                    "value": value,
-                    "probabilities": probabilities,
-                }
-            else:
-                output[decision.name] = value
+        # A field a "when" skipped has no row and no prompt; an array's prompts are its row's.
+        self._last_prompts.set([text for decision, row, prompt in zip(decisions, rows, prompts)
+                                for text in (row["prompts"] if isinstance(decision, ArrayChoice) and row
+                                             else [prompt]) if text is not None])
+        output, thinking, effort, skipped = _assemble(decisions, rows)
 
         if print_final_prompt:
             _print_final_prompts(self._last_prompts.get())
@@ -615,6 +685,52 @@ class TypeLLMClient:
             LOG.info("TypeLLM API call failed (%s); retrying in %.2f s", problem, delay)
             time.sleep(delay)
             attempt += 1
+
+
+def _answer(decision: Choice, row: Mapping[str, Any]) -> Any:
+    """A row's value as the result gives it: with its probabilities when the field asks for them."""
+    if not decision.return_probabilities:
+        return row["value"]
+    return {"value": row["value"],
+            "probabilities": {decision.choices[label]: probability
+                              for label, probability in row["probabilities"].items()}}
+
+
+def _assemble(decisions: Sequence[Any], rows: Sequence[dict | None], prefix: str = ""
+              ) -> tuple[dict[str, Any], dict[str, str], dict[str, str], list[str]]:
+    """The result, each field's reasoning, each "auto" field's effort and the skipped fields.
+
+    Values go to their paths, so an object's properties build it in schema order. A skipped
+    object is named once; a property a "when" skipped is named by its path. prefix names an
+    array item ("skills[0]") for the reasoning, efforts and skips inside it.
+    """
+    def label(path):
+        return prefix + ("." if prefix else "") + ".".join(path) if path else prefix
+
+    output: dict[str, Any] = {}
+    for decision, row in zip(decisions, rows):
+        if decision.effort_for is None and row is not None:  # not a hidden effort question, not skipped
+            _put(output, _path(decision), row["value"] if isinstance(decision, ArrayChoice)
+                 else _answer(decision, row))
+    thinking: dict[str, str] = {}
+    effort: dict[str, str] = {}
+    skipped: list[str] = []
+    for decision, row in zip(decisions, rows):
+        path = _path(decision)
+        if decision.effort_for is not None:
+            if row is not None:
+                effort[label(path[:-1])] = row["value"]
+        elif row is None:
+            name = label(path[:1]) if len(path) > 1 and path[0] not in output else label(path)
+            if name not in skipped:
+                skipped.append(name)
+        elif isinstance(decision, ArrayChoice):
+            thinking.update(row["thinking"])
+            effort.update(row["thinking_effort"])
+            skipped.extend(row["skipped"])
+        elif row.get("thinking"):
+            thinking[label(path)] = row["thinking"]
+    return output, thinking, effort, skipped
 
 
 def candidate_softmax(
@@ -808,7 +924,7 @@ def _mean_order_probabilities(scored, orders, label_tokens, temperature):
 
 def _execute_dependency_decisions(
     client, context, decisions, mode, temperature, rng, numeric_max_digits,
-    image_count=0,
+    image_count=0, prefix_cached=False,
 ):
     rows_by_name = {}
     prompts_by_name = {}
@@ -818,10 +934,14 @@ def _execute_dependency_decisions(
         dependency_values = {}
         parent_prefixes = {}
         settled = []
+        arrays = []
         for decision in layer:
             # Skipped: a dependency was skipped, so its answer does not exist, or the
-            # field's "when" does not match. Either way nothing is sent for it.
-            if any(rows_by_name[name] is None for name in decision.depends_on or ()) or (
+            # field's "when" does not match. Either way nothing is sent for it. An object
+            # is skipped only when all of its properties are.
+            groups = (decision.dependency_groups if decision.dependency_groups is not None
+                      else tuple((name,) for name in decision.depends_on or ()))
+            if any(all(rows_by_name[name] is None for name in group) for group in groups) or (
                     decision.when is not None and not condition_met(
                         decision, {name: rows_by_name[name]["value"] for name, _ in decision.when})):
                 rows_by_name[decision.name] = prompts_by_name[decision.name] = None
@@ -833,34 +953,168 @@ def _execute_dependency_decisions(
             # An effort question is invisible to the field it serves: the field's
             # prompt is the one it would have without thinking: "auto".
             visible -= hidden
-            parents = [name for name in decision.depends_on or () if name not in hidden]
-            if parents:
+            # An array leaves no prompt to continue from: its turns each had their own.
+            parents = [name for name in decision.depends_on or ()
+                       if name not in hidden and prompts_by_name.get(name) is not None]
+            if parents and not isinstance(decision, ArrayChoice):
                 # Longest serialized prefix is a deterministic heuristic; KV
                 # from distinct branches cannot be concatenated.
                 parent = max(parents, key=lambda name: len(prompts_by_name[name]))
                 parent_prefixes[decision.name] = prompts_by_name[parent]
-            dependency_values[decision.name] = {
-                d.name: rows_by_name[d.name]["value"]
-                for d in decisions if d.name in visible
-            }
+            # An object's properties are shown as the object.
+            values = {}
+            for d in decisions:
+                if d.name in visible and rows_by_name[d.name] is not None:
+                    _put(values, _path(d), rows_by_name[d.name]["value"])
+            dependency_values[decision.name] = values
+            if isinstance(decision, ArrayChoice):
+                arrays.append(decision)
+                continue
             if decision.effort_from is not None:
                 budget = THINKING_EFFORTS[rows_by_name[decision.effort_from]["value"]]
                 decision = replace(decision, thinking=budget is not None, thinking_budget=budget)
             settled.append(decision)
-        layer = settled
-        if not layer:
-            continue
-        rows, prompts = _execute_batch_decisions(
-            client, context, layer, mode, temperature, rng, numeric_max_digits,
-            dependency_values=dependency_values,
-            parent_prefixes=parent_prefixes,
-            image_count=image_count,
-        )
-        for decision, row, prompt in zip(layer, rows, prompts):
-            rows_by_name[decision.name] = row
-            prompts_by_name[decision.name] = prompt
+        if settled:
+            rows, prompts = _execute_batch_decisions(
+                client, context, settled, mode, temperature, rng, numeric_max_digits,
+                dependency_values=dependency_values,
+                parent_prefixes=parent_prefixes,
+                image_count=image_count,
+                prefix_cached=prefix_cached,
+            )
+            for decision, row, prompt in zip(settled, rows, prompts):
+                rows_by_name[decision.name] = row
+                prompts_by_name[decision.name] = prompt
+        # The layer's arrays, after its other fields, each in turns of its own.
+        for array in arrays:
+            rows_by_name[array.name] = _generate_array(
+                client, context, array, dependency_values[array.name], mode, temperature, rng,
+                numeric_max_digits, image_count)
+            prompts_by_name[array.name] = None
     return ([rows_by_name[d.name] for d in decisions],
             [prompts_by_name[d.name] for d in decisions])
+
+
+def _describe_item(decision: Choice) -> str:
+    """An item's or a property's type in an array's specification."""
+    or_null = " or null" if decision.nullable else ""
+    if decision.text_type:
+        return "string" + or_null
+    if decision.numeric_type is not None:
+        return decision.numeric_type + or_null
+    if decision.syntax == "Bool":
+        return "boolean" + or_null
+    return "one of " + json.dumps(list(decision.choices.values()), ensure_ascii=False)
+
+
+def _array_specification(array: ArrayChoice, dependency_values: Mapping[str, Any]) -> str:
+    """What an array is to hold: the part of its state that never changes between turns."""
+    lines = [f"Array: {json.dumps(array.name, ensure_ascii=False)}", f"Instructions: {array.question}"]
+    items = [item for item in array.items if item.effort_for is None]
+    def said(item):  # a property's own instructions; the generated default says nothing here
+        return "" if item.question.startswith("Choose the value for ") else f": {item.question}"
+
+    if array.item_object:
+        lines.append("Each item is an object with these properties:")
+        lines += [f"- {json.dumps('.'.join(_path(item)), ensure_ascii=False)} ({_describe_item(item)}){said(item)}"
+                  for item in items]
+    else:
+        lines.append(f"Each item: {_describe_item(items[0])}. {items[0].question}")
+    if dependency_values:
+        lines.append("Dependency results (JSON):\n" + json.dumps(dependency_values, ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def _array_state(context: str, specification: str, items: Sequence[Any]) -> str:
+    """The context, the array's specification and its committed items. The items come last, so each
+    turn's state starts with the one before it, up to the closing bracket."""
+    return f"{context.rstrip()}\n\n{specification}\nCurrent array (JSON): {_canonical_json(list(items))}"
+
+
+# How many times sampling may give an item already in the array before the array stops.
+DUPLICATE_RETRIES = 2
+
+
+def _next_item_kind(client, state, array, mode, temperature, rng, numeric_max_digits, image_count):
+    """What the next item of an object array is: "item", or None to end the array.
+
+    Today an array holds one kind of item, so this is the hidden question whether to append a new
+    item: false ends the array. An array of several kinds would ask which kind comes next, or none,
+    in the same single scoring. The question branches off the state and is never committed to it.
+    """
+    rows, prompts = _execute_batch_decisions(client, state, [array.continue_choice], mode, temperature, rng,
+                                             numeric_max_digits, image_count=image_count)
+    return ("item" if rows[0]["value"] else None), prompts
+
+
+def _generate_array(client, context, array, dependency_values, mode, temperature, rng,
+                    numeric_max_digits, image_count=0):
+    """An array's items, one turn at a time, each turn on the full state so far.
+
+    Below minItems a turn simply generates an item. Past it, a scalar item is asked for as nullable,
+    and null ends the array: one request a turn. An object array first asks what the next item is
+    (_next_item_kind); an item follows only if there is one, its properties forking from the state
+    side by side. Each item is committed to the state. An item already in the array is not added
+    again: with argmax the next turn would give it again, so the array ends; sampling may try again
+    a few times. The array also ends at maxItems, or at MAX_ARRAY_ITEMS without one.
+    """
+    specification = _array_specification(array, dependency_values)
+    items: list[Any] = []
+    committed: set[str] = set()
+    prompts: list[str] = []
+    thinking: dict[str, str] = {}
+    efforts: dict[str, str] = {}
+    skipped: list[str] = []
+    retries = 0 if mode == "argmax" else DUPLICATE_RETRIES
+    limit = MAX_ARRAY_ITEMS if array.max_items is None else array.max_items
+    while len(items) < limit:
+        state = _array_state(context, specification, items)
+        may_end = len(items) >= array.min_items
+        asked = may_end and array.open_items is None
+        if asked:
+            kind, turn = _next_item_kind(client, state, array, mode, temperature, rng, numeric_max_digits,
+                                         image_count)
+            prompts += turn
+            if kind is None:
+                break
+        decisions = list(array.open_items if may_end and array.open_items is not None else array.items)
+        run_item = (_execute_dependency_decisions if any(d.depends_on is not None for d in decisions)
+                    else _execute_batch_decisions)
+        # The continue question's prompt starts with the state, so once it is asked the state is cached.
+        rows, turn = run_item(client, state, decisions, mode, temperature, rng, numeric_max_digits,
+                              image_count=image_count, prefix_cached=asked)
+        prompts += [prompt for prompt in turn if prompt is not None]
+        item_prefix = f"{array.name}[{len(items)}]"
+        output, item_thinking, item_efforts, item_skipped = _assemble(decisions, rows, item_prefix)
+        item = output if array.item_object else output.get("item")
+        if not array.item_object:
+            if may_end and array.open_items is not None and item is None:
+                break  # null: the array is complete
+            # A scalar item is named by its index alone, "skills[0]".
+            item_thinking = {item_prefix: text for text in item_thinking.values()}
+            item_efforts = {item_prefix: effort for effort in item_efforts.values()}
+        key = _canonical_json(item)
+        if key in committed:
+            LOG.info("array=%s duplicate item %s", array.name, key)
+            if retries == 0:
+                break
+            retries -= 1
+            continue
+        committed.add(key)
+        items.append(item)
+        thinking.update(item_thinking)
+        efforts.update(item_efforts)
+        skipped += item_skipped
+    return {"name": array.name, "question": array.question, "label": None, "value": items,
+            "probabilities": None, "thinking": thinking, "thinking_effort": efforts, "skipped": skipped,
+            "prompts": prompts}
+
+
+def _prompts_sent(decision: Choice) -> int:
+    """How many prompts a decision sends from its prefix: two or more for a choice averaged over orderings."""
+    if decision.text_type or decision.numeric_type is not None or decision.permutations == 1:
+        return 1
+    return 2
 
 
 def _execute_batch_decisions(
@@ -874,7 +1128,9 @@ def _execute_batch_decisions(
     dependency_values: Mapping[str, Mapping[str, Any]] | None = None,
     parent_prefixes: Mapping[str, str] | None = None,
     image_count: int = 0,
+    prefix_cached: bool = False,
 ) -> tuple[list[dict], list[str]]:
+    """prefix_cached: the context's prompt was just sent, so SGLang has it cached and it needs no warm-up."""
     def question_content(decision):
         content = decision.opening_text()
         values = (dependency_values or {}).get(decision.name, {})
@@ -903,14 +1159,19 @@ def _execute_batch_decisions(
     scoring_ids = []
     ordering_groups = []
 
-    # Warm each distinct parent once before siblings, including thinking/text
-    # requests. Root context is warmed only in the first DAG layer.
+    # Warm each parent that two or more of the layer's prompts continue, before them, including
+    # thinking/text requests: prompts sent in one batch cannot reuse each other's cache. A prefix
+    # only one prompt continues is cached by that prompt. Root context is warmed only in the first DAG layer.
     if incremental:
+        users = Counter()
+        for decision in decisions:
+            users[parent_prefixes.get(decision.name, shared_prefix)] += _prompts_sent(decision)
         prefixes = list(dict.fromkeys(parent_prefixes.values()))
         if any(d.name not in parent_prefixes for d in decisions):
             prefixes.insert(0, shared_prefix)
         for prefix in prefixes:
-            client.cache_prefix(prefix)
+            if users[prefix] >= 2 and not (prefix_cached and prefix == shared_prefix):
+                client.cache_prefix(prefix)
 
     finite_indexes: list[int] = []
     open_results: dict[int, tuple[dict, str]] = {}
@@ -986,7 +1247,8 @@ def _execute_batch_decisions(
     # prefilled in the same batch cannot reuse each other's cache, so thinking,
     # number and text batches would each prefill the context once per prompt.
     # SGLang then forks the cached state; TypeLLM never reads or moves KV tensors.
-    if finite_indexes and not incremental:
+    # A lone prompt, such as an array's continue question, caches the prefix itself.
+    if finite_indexes and not incremental and not prefix_cached and sum(map(_prompts_sent, decisions)) >= 2:
         cache_meta = client.cache_prefix(shared_prefix)
         LOG.info("batch_shared_prefix_cached_tokens=%s", cache_meta.get("cached_tokens"))
 
@@ -1006,19 +1268,24 @@ def _execute_batch_decisions(
     numeric_pending = [item for item in open_pending if item[1].numeric_type is not None]
     text_pending = [item for item in open_pending if item[1].text_type]
 
-    # A layer's numbers and strings decode side by side in one request.
+    # A layer's numbers and strings decode side by side in one request, and its choices are
+    # scored in that same request when the client can: one round trip for the layer, not two.
+    merged = bool((numeric_pending or text_pending) and prompts
+                  and callable(getattr(client, "generate_and_score", None)))
     if numeric_pending or text_pending:
         number_items = [(prompt + decision.answer_prefill, decision)
                         for _, decision, _, prompt in numeric_pending]
         number_seed = rng.randrange(2**31) if numeric_pending else 0
         text_seed = rng.randrange(2**31) if text_pending else 0
-        raw_numbers, values = client.generate_fields(
+        fields = (
             [prompt for prompt, _ in number_items],
             [numeric_pattern(d.numeric_type or "", numeric_max_digits, d.nullable) for _, d in number_items],
             # Digits, sign, point and the closing brace; tokens hold one or more characters.
             numeric_max_digits + 4,
             # From {"name": the model writes the string's first token, quote included.
             [prompt + decision.answer_prefill for _, decision, _, prompt in text_pending],
+        )
+        options = dict(
             temperature=0 if mode == "argmax" else temperature,
             number_seed=number_seed,
             text_seed=text_seed,
@@ -1026,6 +1293,11 @@ def _execute_batch_decisions(
             # A nullable string writes null or its text in the same request.
             nullable=[decision.nullable for _, decision, _, _ in text_pending],
         )
+        if merged:
+            raw_numbers, values, scored, elapsed = client.generate_and_score(
+                *fields, scoring_prompts, scoring_ids, **options)
+        else:
+            raw_numbers, values = client.generate_fields(*fields, **options)
         for (index, decision, messages, prompt), (value, _completed, generated_text) in zip(
                 numeric_pending, _parse_numbers(number_items, raw_numbers)):
             open_results[index] = (open_row(decision, value),
@@ -1035,7 +1307,8 @@ def _execute_batch_decisions(
             open_results[index] = (open_row(decision, value), completed)
 
     if prompts:
-        scored, elapsed = client.score_candidates_batch(scoring_prompts, scoring_ids)
+        if not merged:
+            scored, elapsed = client.score_candidates_batch(scoring_prompts, scoring_ids)
         grouped_scores = []
         offset = 0
         for orders in ordering_groups:

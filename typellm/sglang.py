@@ -1025,6 +1025,63 @@ class SGLangClient:
         return (self._read_numbers(items[:split]),
                 self._read_texts(items[split:], nullable, after_key))
 
+    def generate_and_score(
+        self,
+        number_prefixes: Sequence[str],
+        patterns: Sequence[str],
+        number_max_tokens: int,
+        text_prefixes: Sequence[str],
+        score_prefixes: Sequence[str],
+        candidate_ids: Sequence[Sequence[int]],
+        *,
+        temperature: float = 0,
+        number_seed: int = 0,
+        text_seed: int = 0,
+        after_key: bool = False,
+        nullable: Sequence[bool] | None = None,
+    ) -> tuple[list[str], list[str | None], list[tuple[dict[int, float], Mapping[str, Any]]], float]:
+        """A layer's choices, numbers and strings in one request: what score_candidates_batch and
+        generate_fields would return, and the request's time, with one round trip instead of two.
+
+        Each prompt carries its own sampling params and logprob settings; a generated prompt has no
+        candidates, an empty list (SGLang's request validation refuses None there). The scored
+        prompts come first: SGLang reads token_ids_logprob as one list per prompt only when its
+        first entry is a non-empty list, so a generated prompt first would hand every prompt the
+        same candidates.
+        """
+        if not score_prefixes:
+            raise ValueError("generate_and_score needs at least one prompt to score")
+        if len(score_prefixes) != len(candidate_ids):
+            raise ValueError("score_prefixes and candidate_ids must have the same length")
+        if len(number_prefixes) != len(patterns):
+            raise ValueError("prefixes and patterns must have the same length")
+        nullable = self._check_nullable(nullable, text_prefixes)
+        generated = (self._number_params(patterns, number_max_tokens, temperature, number_seed)
+                     + (self._text_params(nullable, after_key, temperature, text_seed) if text_prefixes else []))
+        scored = len(score_prefixes)
+        prefixes = list(score_prefixes) + list(number_prefixes) + list(text_prefixes)
+        payload = {
+            "text": prefixes,
+            "sampling_params": [{"max_new_tokens": 1, "temperature": 0}] * scored + generated,
+            "return_logprob": [True] * scored + [False] * len(generated),
+            "token_ids_logprob": [list(ids) for ids in candidate_ids] + [[] for _ in generated],
+            "return_text_in_logprobs": True,
+        }
+        start = time.perf_counter()
+        response = self._generate(payload)
+        elapsed = time.perf_counter() - start
+        if isinstance(response, Mapping) and len(prefixes) == 1:
+            response = [response]
+        if not isinstance(response, list) or len(response) != len(prefixes):
+            raise SGLangError("Unexpected scored and generated batch response shape")
+        scores = []
+        for item, ids in zip(response[:scored], candidate_ids):
+            meta = item.get("meta_info", {}) if isinstance(item, Mapping) else {}
+            scores.append((extract_candidate_logprobs(item, ids), meta if isinstance(meta, Mapping) else {}))
+        split = scored + len(number_prefixes)
+        return (self._read_numbers(response[scored:split]),
+                self._read_texts(response[split:], nullable, after_key), scores, elapsed)
+
     def flush_cache(self) -> None:
         reply = self._request("/flush_cache", {}, allow_text=True)
         if isinstance(reply, str) and not reply.startswith("Cache flushed."):
