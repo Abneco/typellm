@@ -104,6 +104,15 @@ class PrefixWarmupTests(unittest.TestCase):
                 self.assertIn("Receipt", warm[0]["text"])
                 self.assertNotIn('{"a":', warm[0]["text"])
 
+    def test_a_lone_prompt_is_not_warmed_but_a_permuted_choice_is(self):
+        for field, warmed in (({"type": "string", "enum": ["x", "y"]}, 0),
+                              ({"type": "string", "enum": ["x", "y"], "permutations": "auto"}, 1)):
+            with self.subTest(field=field):
+                client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
+                client.sglang = FakeServer()
+                client.generate(context="Receipt", questions={"k": field}).result
+                self.assertEqual(len(client.sglang.requests("count")), warmed)
+
     def test_open_fields_alone_are_not_warmed(self):
         client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = FakeServer()

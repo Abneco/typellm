@@ -291,9 +291,6 @@ Items can be enum values, or objects:
 - A property takes what a field takes: `instructions`, `enum`, `thinking`, and
   `depends_on` or `when` on other properties of the same object. Objects can
   hold objects. A field that `depends_on` an object or an array sees all of it.
-- An item's properties are generated in the order they are declared, each seeing
-  the ones before it, so they all describe the same item: put first the property
-  that identifies it.
 - `minItems` and `maxItems` bound an array. An array holds at most 50 items,
   each distinct from the others.
 - An object or an array can itself have `depends_on` and `when`; skipped, it is

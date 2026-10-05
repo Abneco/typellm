@@ -11,6 +11,7 @@ import threading
 import time
 import warnings
 from contextlib import nullcontext
+from collections import Counter
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from itertools import permutations as all_permutations
@@ -20,6 +21,7 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from .schema import (
+    CONTINUE_FIELD,
     CONTINUE_QUESTION,
     MAX_ARRAY_ITEMS,
     MAX_ENUM_CHOICES,
@@ -169,6 +171,8 @@ class ArrayChoice:
     item_object: bool
     continue_choice: Choice
     min_items: int = 0
+    # A scalar array's nullable items past minItems, null ending it; None asks continue_choice instead.
+    open_items: tuple[Choice, ...] | None = None
     max_items: int | None = None
     depends_on: tuple[str, ...] | None = None
     when: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] | None = None
@@ -372,7 +376,7 @@ class TypeLLMClient:
             decisions = compile_json_schema(schema)
             arrays = [item for item in decisions if isinstance(item, ArrayField)]
             scalars = [item for item in decisions if not isinstance(item, ArrayField)]
-            scalars += [item for array in arrays for item in array.items]
+            scalars += [item for array in arrays for item in array.items + (array.open_items or ())]
             # An array's continue question is a boolean: two labels.
             finite_sizes = [len(item.choices) for item in scalars if item.choices] + [2] * bool(arrays)
             labels = self._control_labels(max(finite_sizes)) if finite_sizes else []
@@ -407,12 +411,13 @@ class TypeLLMClient:
                     items=tuple(bind(item) for item in array.items),
                     item_object=array.item_object,
                     continue_choice=Choice(question=CONTINUE_QUESTION, choices=dict(zip(labels, (True, False))),
-                                           syntax="Bool", thinking=False),
+                                           name=CONTINUE_FIELD, syntax="Bool", thinking=False),
                     min_items=array.min_items,
                     max_items=array.max_items,
                     depends_on=array.depends_on,
                     when=array.when,
                     dependency_groups=array.dependency_groups,
+                    open_items=None if array.open_items is None else tuple(bind(item) for item in array.open_items),
                 )
 
             return [bind_array(item) if isinstance(item, ArrayField) else bind(item) for item in decisions]
@@ -919,7 +924,7 @@ def _mean_order_probabilities(scored, orders, label_tokens, temperature):
 
 def _execute_dependency_decisions(
     client, context, decisions, mode, temperature, rng, numeric_max_digits,
-    image_count=0,
+    image_count=0, prefix_cached=False,
 ):
     rows_by_name = {}
     prompts_by_name = {}
@@ -975,6 +980,7 @@ def _execute_dependency_decisions(
                 dependency_values=dependency_values,
                 parent_prefixes=parent_prefixes,
                 image_count=image_count,
+                prefix_cached=prefix_cached,
             )
             for decision, row, prompt in zip(settled, rows, prompts):
                 rows_by_name[decision.name] = row
@@ -1005,10 +1011,13 @@ def _array_specification(array: ArrayChoice, dependency_values: Mapping[str, Any
     """What an array is to hold: the part of its state that never changes between turns."""
     lines = [f"Array: {json.dumps(array.name, ensure_ascii=False)}", f"Instructions: {array.question}"]
     items = [item for item in array.items if item.effort_for is None]
+    def said(item):  # a property's own instructions; the generated default says nothing here
+        return "" if item.question.startswith("Choose the value for ") else f": {item.question}"
+
     if array.item_object:
         lines.append("Each item is an object with these properties:")
-        lines += [f"- {json.dumps('.'.join(_path(item)), ensure_ascii=False)} ({_describe_item(item)}): "
-                  f"{item.question}" for item in items]
+        lines += [f"- {json.dumps('.'.join(_path(item)), ensure_ascii=False)} ({_describe_item(item)}){said(item)}"
+                  for item in items]
     else:
         lines.append(f"Each item: {_describe_item(items[0])}. {items[0].question}")
     if dependency_values:
@@ -1026,16 +1035,28 @@ def _array_state(context: str, specification: str, items: Sequence[Any]) -> str:
 DUPLICATE_RETRIES = 2
 
 
+def _next_item_kind(client, state, array, mode, temperature, rng, numeric_max_digits, image_count):
+    """What the next item of an object array is: "item", or None to end the array.
+
+    Today an array holds one kind of item, so this is the hidden question whether to append a new
+    item: false ends the array. An array of several kinds would ask which kind comes next, or none,
+    in the same single scoring. The question branches off the state and is never committed to it.
+    """
+    rows, prompts = _execute_batch_decisions(client, state, [array.continue_choice], mode, temperature, rng,
+                                             numeric_max_digits, image_count=image_count)
+    return ("item" if rows[0]["value"] else None), prompts
+
+
 def _generate_array(client, context, array, dependency_values, mode, temperature, rng,
                     numeric_max_digits, image_count=0):
     """An array's items, one turn at a time, each turn on the full state so far.
 
-    Past minItems, a turn first asks the hidden continue question; true generates one item
-    (an object's properties as decisions of their own), which is committed to the state. The
-    continue question never is: it branches off the state and is dropped. An item already in
-    the array is not added again: with argmax the next turn would give it again, so the array
-    ends; sampling may try again a few times. The array also ends at maxItems, or at
-    MAX_ARRAY_ITEMS without one.
+    Below minItems a turn simply generates an item. Past it, a scalar item is asked for as nullable,
+    and null ends the array: one request a turn. An object array first asks what the next item is
+    (_next_item_kind); an item follows only if there is one, its properties forking from the state
+    side by side. Each item is committed to the state. An item already in the array is not added
+    again: with argmax the next turn would give it again, so the array ends; sampling may try again
+    a few times. The array also ends at maxItems, or at MAX_ARRAY_ITEMS without one.
     """
     specification = _array_specification(array, dependency_values)
     items: list[Any] = []
@@ -1046,23 +1067,30 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
     skipped: list[str] = []
     retries = 0 if mode == "argmax" else DUPLICATE_RETRIES
     limit = MAX_ARRAY_ITEMS if array.max_items is None else array.max_items
-    run_item = (_execute_dependency_decisions if any(d.depends_on is not None for d in array.items)
-                else _execute_batch_decisions)
     while len(items) < limit:
         state = _array_state(context, specification, items)
-        if len(items) >= array.min_items:
-            rows, turn = _execute_batch_decisions(client, state, [array.continue_choice], mode, temperature,
-                                                  rng, numeric_max_digits, image_count=image_count)
+        may_end = len(items) >= array.min_items
+        asked = may_end and array.open_items is None
+        if asked:
+            kind, turn = _next_item_kind(client, state, array, mode, temperature, rng, numeric_max_digits,
+                                         image_count)
             prompts += turn
-            if not rows[0]["value"]:
+            if kind is None:
                 break
-        rows, turn = run_item(client, state, list(array.items), mode, temperature, rng, numeric_max_digits,
-                              image_count=image_count)
+        decisions = list(array.open_items if may_end and array.open_items is not None else array.items)
+        run_item = (_execute_dependency_decisions if any(d.depends_on is not None for d in decisions)
+                    else _execute_batch_decisions)
+        # The continue question's prompt starts with the state, so once it is asked the state is cached.
+        rows, turn = run_item(client, state, decisions, mode, temperature, rng, numeric_max_digits,
+                              image_count=image_count, prefix_cached=asked)
         prompts += [prompt for prompt in turn if prompt is not None]
         item_prefix = f"{array.name}[{len(items)}]"
-        output, item_thinking, item_efforts, item_skipped = _assemble(array.items, rows, item_prefix)
+        output, item_thinking, item_efforts, item_skipped = _assemble(decisions, rows, item_prefix)
         item = output if array.item_object else output.get("item")
-        if not array.item_object:  # a scalar item is named by its index alone, "skills[0]"
+        if not array.item_object:
+            if may_end and array.open_items is not None and item is None:
+                break  # null: the array is complete
+            # A scalar item is named by its index alone, "skills[0]".
             item_thinking = {item_prefix: text for text in item_thinking.values()}
             item_efforts = {item_prefix: effort for effort in item_efforts.values()}
         key = _canonical_json(item)
@@ -1082,6 +1110,13 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
             "prompts": prompts}
 
 
+def _prompts_sent(decision: Choice) -> int:
+    """How many prompts a decision sends from its prefix: two or more for a choice averaged over orderings."""
+    if decision.text_type or decision.numeric_type is not None or decision.permutations == 1:
+        return 1
+    return 2
+
+
 def _execute_batch_decisions(
     client: SGLangClient,
     context: str,
@@ -1093,7 +1128,9 @@ def _execute_batch_decisions(
     dependency_values: Mapping[str, Mapping[str, Any]] | None = None,
     parent_prefixes: Mapping[str, str] | None = None,
     image_count: int = 0,
+    prefix_cached: bool = False,
 ) -> tuple[list[dict], list[str]]:
+    """prefix_cached: the context's prompt was just sent, so SGLang has it cached and it needs no warm-up."""
     def question_content(decision):
         content = decision.opening_text()
         values = (dependency_values or {}).get(decision.name, {})
@@ -1122,14 +1159,19 @@ def _execute_batch_decisions(
     scoring_ids = []
     ordering_groups = []
 
-    # Warm each distinct parent once before siblings, including thinking/text
-    # requests. Root context is warmed only in the first DAG layer.
+    # Warm each parent that two or more of the layer's prompts continue, before them, including
+    # thinking/text requests: prompts sent in one batch cannot reuse each other's cache. A prefix
+    # only one prompt continues is cached by that prompt. Root context is warmed only in the first DAG layer.
     if incremental:
+        users = Counter()
+        for decision in decisions:
+            users[parent_prefixes.get(decision.name, shared_prefix)] += _prompts_sent(decision)
         prefixes = list(dict.fromkeys(parent_prefixes.values()))
         if any(d.name not in parent_prefixes for d in decisions):
             prefixes.insert(0, shared_prefix)
         for prefix in prefixes:
-            client.cache_prefix(prefix)
+            if users[prefix] >= 2 and not (prefix_cached and prefix == shared_prefix):
+                client.cache_prefix(prefix)
 
     finite_indexes: list[int] = []
     open_results: dict[int, tuple[dict, str]] = {}
@@ -1205,7 +1247,8 @@ def _execute_batch_decisions(
     # prefilled in the same batch cannot reuse each other's cache, so thinking,
     # number and text batches would each prefill the context once per prompt.
     # SGLang then forks the cached state; TypeLLM never reads or moves KV tensors.
-    if finite_indexes and not incremental:
+    # A lone prompt, such as an array's continue question, caches the prefix itself.
+    if finite_indexes and not incremental and not prefix_cached and sum(map(_prompts_sent, decisions)) >= 2:
         cache_meta = client.cache_prefix(shared_prefix)
         LOG.info("batch_shared_prefix_cached_tokens=%s", cache_meta.get("cached_tokens"))
 

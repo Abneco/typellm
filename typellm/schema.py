@@ -65,6 +65,9 @@ class ArrayField:
     depends_on: tuple[str, ...] | None = None
     when: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] | None = None
     dependency_groups: tuple[tuple[str, ...], ...] | None = None
+    # A scalar array's items past minItems: the same decisions, the item nullable, null ending the
+    # array. None for an object array, or an item already nullable: those ask the continue question.
+    open_items: tuple[Decision, ...] | None = None
     # As on Decision, for code that handles both: an array is never an effort question.
     effort_for: None = None
     effort_from: None = None
@@ -77,16 +80,20 @@ class ArrayField:
 # Without maxItems, an array stops after this many items whatever the model says.
 MAX_ARRAY_ITEMS = 50
 
-# The hidden question an array asks before each item past its minItems.
-CONTINUE_QUESTION = (
-    "Given the context, the array specification and the current array above, should one more "
-    "distinct item be generated? Answer true if adding another distinct item would materially "
-    "improve how well the array satisfies its specification, and false if the current array "
-    "already satisfies it."
-)
+# The hidden question an object array asks before each item past its minItems; false ends the array.
+# Of the wordings tried on Qwen3.8 (2026-10-05), this plain one was right on arrays found in the
+# context and arrays the model produces alike: "would another item improve the array" stopped empty
+# arrays early, and "does the context mention another" stopped produced ones.
+CONTINUE_QUESTION = "Should a new item be appended to the current array?"
+# The name the question is asked under, so its answer starts as a field's does.
+CONTINUE_FIELD = "append_item"
 # What opens the prompt of an item, or of each property of an object item.
 ITEM_SCOPE = ("Give the next item of the array above: one new item, distinct from the items "
               "already in the current array.\n")
+# A scalar item past minItems may end the array instead, with null.
+OPEN_ITEM_SCOPE = ("Give the next item of the array above: one new item, distinct from the items already in "
+                   "the current array. Answer null instead if the current array already satisfies the "
+                   "specification, with no distinct item left that would materially improve it.\n")
 OBJECT_ITEM_SCOPE = ("Give the next item of the array above: one new object, distinct from the objects "
                      "already in the current array. Answer one of its properties.\n")
 
@@ -207,8 +214,6 @@ class _Entry:
     decision: Decision
     field: Mapping[str, Any]
     scope: dict[str, tuple[str, Any]] | None
-    # Dependencies the schema implies: an array item's earlier properties.
-    implied_groups: tuple[tuple[str, ...], ...] = ()
     # The objects around it: their own depends_on and when, linked in the scope around each.
     outer: tuple[tuple[Mapping[str, Any], dict[str, tuple[str, Any]], str], ...] = ()
 
@@ -340,11 +345,8 @@ def _array(name: str, field: Mapping[str, Any]) -> ArrayField:
             if key in items:
                 raise SchemaError(f"{key} is not supported on the items of {name!r}; "
                                   "set it on the array, or on the items' properties")
+        # An item's properties fork from the turn's state side by side; a depends_on between them orders them.
         entries = _object_entries((), items, label, inside_array=True, around={})
-        # An item's properties describe one thing: each is generated after the ones declared before it,
-        # and sees them, so that they all describe the same item.
-        for index, entry in enumerate(entries):
-            entry.implied_groups = tuple((before.decision.name,) for before in entries[:index])
         decisions = [replace(decision, scope=OBJECT_ITEM_SCOPE + decision.scope) if decision.effort_for is None
                      else decision for decision in _link(entries)]
     else:
@@ -359,7 +361,15 @@ def _array(name: str, field: Mapping[str, Any]) -> ArrayField:
                      else decision
                      for decision in _link([_Entry(replace(item, path=("item",), question=item_question),
                                                    items, {})])]
-    return ArrayField(name, question, tuple(decisions), kind == "object", min_items, max_items)
+        main = next(decision for decision in decisions if decision.effort_for is None)
+        open_items = None
+        # null as one more choice must fit the enum's labels.
+        if not main.nullable and len(main.choices) < MAX_ENUM_CHOICES:
+            nullable = replace(main, nullable=True, scope=OPEN_ITEM_SCOPE,
+                               choices=main.choices + ((None,) if main.choices else ()))
+            open_items = tuple(nullable if decision is main else decision for decision in decisions)
+        return ArrayField(name, question, tuple(decisions), False, min_items, max_items, open_items=open_items)
+    return ArrayField(name, question, tuple(decisions), True, min_items, max_items)
 
 
 def _link_array(array: ArrayField, field: Mapping[str, Any], scope, linked: Sequence[Decision]) -> ArrayField:
@@ -418,9 +428,9 @@ def _link(entries: Sequence[_Entry]) -> list[Decision]:
     for entry in entries:
         decision, field = entry.decision, entry.field
         label = ".".join(decision.path) if decision.path else decision.name
-        groups: list[tuple[str, ...]] = list(entry.implied_groups)
+        groups: list[tuple[str, ...]] = []
         whens: list = []
-        found = bool(groups)
+        found = False
         # The objects around the field first, outermost first, then its own.
         for outer_field, outer_scope, outer_label in entry.outer:
             outer_groups, outer_when = _dependencies(outer_label, outer_field, outer_scope, by_id)

@@ -68,9 +68,9 @@ class DependencyTests(unittest.TestCase):
         self.assertTrue(d.startswith(b))
         self.assertNotIn('name="c"', b)
         self.assertNotIn('name="b"', c)
-        self.assertEqual(client.sglang.cached_prefixes, [
-            '<user>long context</user>', a, b,
-        ])
+        # Only a prefix two prompts of a layer continue is warmed: b and c both continue a. The context
+        # (a alone) and b (d alone) are cached by the one prompt that continues each.
+        self.assertEqual(client.sglang.cached_prefixes, [a])
         # Completed prefixes retain the exact prompt sent for scoring.
         for batch, completed in zip(client.sglang.batch_prompts, [[a], [b, c], [d]]):
             for prompt, final in zip(batch, completed):

@@ -24,8 +24,8 @@ def field(prompt):
 
 
 class ScriptServer(FakeServer):
-    """A FakeServer whose continue questions answer `more`, in order, then false; strings, numbers and
-    choices come from callables of the prompt when given."""
+    """A FakeServer whose continue questions go on as `more` says, in order, then end the array; strings,
+    numbers and choices come from callables of the prompt when given."""
 
     def __init__(self, more=(), texts=None, numbers=None, choose=None):
         super().__init__()
@@ -44,6 +44,7 @@ class ScriptServer(FakeServer):
             rows = [rows] if isinstance(rows[0], int) else rows
             for text, ids, item in zip(texts, rows, out):
                 if CONTINUE_MARK in text:
+                    # "Append a new item?": true (the first label) goes on, false ends the array.
                     self.continue_prompts.append(text)
                     pick = ids[0] if (self.more.pop(0) if self.more else False) else ids[1]
                 elif self.choose:
@@ -183,42 +184,66 @@ SKILLS = {"type": "array", "items": {"type": "string"}, "instructions": "Return 
 NAMES = ["Python", "CUDA", "PyTorch", "Rust"]
 
 
-def skills_server(more, **options):
-    # A string outside the array (no state in its prompt) is "Senior".
-    return ScriptServer(more, texts=lambda prompt: NAMES[len(current(prompt))] if STATE_MARK in prompt
-                        else "Senior", **options)
+NULL_MARK = "Answer null instead"
+
+
+def skills_server(count, **options):
+    """The n-th skill for each string item, and null once `count` are in where the prompt allows it.
+    An object array's continue question answers true `count` times. A string outside an array is "Senior"."""
+    def texts(prompt):
+        if STATE_MARK not in prompt:
+            return "Senior"
+        n = len(current(prompt))
+        return None if n >= count and NULL_MARK in prompt else NAMES[n]
+    return ScriptServer([True] * count, texts=texts, **options)
+
+
+def item_prompts(sent):
+    return [t for t in sent if 'Field: "item"' in t]
 
 
 class ArrayTests(unittest.TestCase):
     def test_the_state_states_the_arrays_own_instructions(self):
         for items in ({"type": "string"}, {"type": "string", "instructions": "A skill's name."}):
             with self.subTest(items=items):
-                _, _, server = run({"skills": {**SKILLS, "items": items}}, skills_server([]))
+                _, sent, _ = run({"skills": {**SKILLS, "items": items}}, skills_server(0))
                 self.assertIn('Array: "skills"\nInstructions: Return all distinct relevant skills.\n',
-                              server.continue_prompts[0])
+                              item_prompts(sent)[0])
 
     def test_an_empty_array(self):
-        done, sent, server = run({"skills": SKILLS}, skills_server([]))
+        # A scalar array asks no continue question: its item may be null, and null ends it.
+        done, sent, server = run({"skills": SKILLS}, skills_server(0))
         self.assertEqual(done.result, {"skills": []})
-        self.assertEqual(len(server.continue_prompts), 1)
-        self.assertFalse(any('Field: "item"' in t for t in sent))
+        self.assertEqual(server.continue_prompts, [])
+        [asked] = item_prompts(sent)
+        self.assertIn(NULL_MARK, asked)
+        self.assertIn('Answer as {"item": <string or null>}.', asked)
 
     def test_one_item(self):
-        done, _, server = run({"skills": SKILLS}, skills_server([True]))
+        done, sent, _ = run({"skills": SKILLS}, skills_server(1))
         self.assertEqual(done.result, {"skills": ["Python"]})
-        self.assertEqual(len(server.continue_prompts), 2)
+        self.assertEqual(len(item_prompts(sent)), 2)  # Python, then null: one request a turn
 
     def test_several_strings(self):
-        done, _, _ = run({"skills": SKILLS}, skills_server([True, True, True]))
+        done, _, _ = run({"skills": SKILLS}, skills_server(3))
         self.assertEqual(done.result, {"skills": ["Python", "CUDA", "PyTorch"]})
 
     def test_an_enum_array(self):
         risks = ["market", "credit", "liquidity", "operational"]
-        server = ScriptServer([True, True], choose=lambda prompt, ids: (
-            ids[[1, 3][len(current(prompt))]] if 'Field: "item"' in prompt else None))
-        done, _, _ = run({"risks": {"type": "array", "items": {"type": "string", "enum": risks},
-                                    "instructions": "Return all applicable risks."}}, server)
+        # The item's choices gain null as the last; it ends the array.
+        server = ScriptServer([], choose=lambda prompt, ids: (
+            ids[[1, 3, len(ids) - 1][len(current(prompt))]] if 'Field: "item"' in prompt else None))
+        done, _, server = run({"risks": {"type": "array", "items": {"type": "string", "enum": risks},
+                                         "instructions": "Return all applicable risks."}}, server)
         self.assertEqual(done.result, {"risks": ["credit", "operational"]})
+        self.assertEqual(server.continue_prompts, [])
+
+    def test_a_nullable_item_asks_the_continue_question(self):
+        # null is then an item, not the end: the array asks whether to go on, as an object array does.
+        done, _, server = run({"tips": {"type": "array", "items": {"type": ["string", "null"]}}},
+                              ScriptServer([True], texts=lambda prompt: "cash"))
+        self.assertEqual(done.result, {"tips": ["cash"]})
+        self.assertEqual(len(server.continue_prompts), 2)
 
     def test_an_array_of_objects(self):
         jobs = [("Google", "Engineer", 2020, False), ("Stripe", "Senior Engineer", 2023, True)]
@@ -235,75 +260,92 @@ class ArrayTests(unittest.TestCase):
             {"company": "Google", "title": "Engineer", "start_year": 2020, "current": False},
             {"company": "Stripe", "title": "Senior Engineer", "start_year": 2023, "current": True},
         ]})
-        # Each property is generated after the ones before it, and sees them.
-        title = [t for t in sent if 'Field: "title"' in t][0]
-        self.assertIn('Dependency results (JSON):\n{"company": "Google"}', title)
-        current_role = [t for t in sent if 'Field: "current"' in t][0]
-        self.assertIn('{"company": "Google", "title": "Engineer", "start_year": 2020}', current_role)
-        self.assertLess(sent.index(title), sent.index(current_role))
+        # An item's properties fork from the same state in one batch, none seeing another's value.
+        first = [t for t in sent if "Field: " in t and CONTINUE_MARK not in t and current(t) == []]
+        self.assertEqual(sorted(field(t) for t in first), ["company", "current", "start_year", "title"])
+        self.assertFalse(any("Dependency results" in t for t in first))
         # The committed object, in its canonical form, is the state of the next turn.
         self.assertTrue(any(STATE_MARK + '[{"company":"Google","title":"Engineer","start_year":2020,'
                             '"current":false}]' in t for t in sent))
 
-    def test_min_items_are_generated_without_asking(self):
-        done, _, server = run({"skills": {**SKILLS, "minItems": 2}}, skills_server([]))
+    def test_min_items_are_generated_before_null_is_allowed(self):
+        done, sent, _ = run({"skills": {**SKILLS, "minItems": 2}}, skills_server(0))
         self.assertEqual(done.result, {"skills": ["Python", "CUDA"]})
-        self.assertEqual([current(p) for p in server.continue_prompts], [["Python", "CUDA"]])
+        self.assertEqual([NULL_MARK in t for t in item_prompts(sent)], [False, False, True])
 
     def test_max_items_stops_without_asking(self):
-        done, _, server = run({"skills": {**SKILLS, "maxItems": 2}}, skills_server([True] * 5))
+        done, sent, _ = run({"skills": {**SKILLS, "maxItems": 2}}, skills_server(5))
         self.assertEqual(done.result, {"skills": ["Python", "CUDA"]})
-        self.assertEqual(len(server.continue_prompts), 2)
+        self.assertEqual(len(item_prompts(sent)), 2)
 
     def test_an_item_already_in_the_array_ends_it(self):
         for options in ({}, {"temperature": 0.7, "seed": 1}):
             with self.subTest(options=options):
-                server = ScriptServer([True] * 10, texts=lambda prompt: "Python")
-                done, _, server = run({"skills": SKILLS}, server, **options)
+                done, sent, _ = run({"skills": SKILLS}, ScriptServer([], texts=lambda prompt: "Python"), **options)
                 self.assertEqual(done.result, {"skills": ["Python"]})
                 # argmax stops at the first repeat; sampling tries again twice.
-                self.assertEqual(len(server.continue_prompts), 2 if not options else 4)
+                self.assertEqual(len(item_prompts(sent)), 2 if not options else 4)
 
     def test_an_array_beside_independent_fields(self):
         done, _, _ = run({"title": {"type": "string"}, "skills": SKILLS, "senior": {"type": "boolean"}},
-                         skills_server([True]))
+                         skills_server(1))
         self.assertEqual(done.result, {"title": "Senior", "skills": ["Python"], "senior": True})
         self.assertEqual(list(done.result), ["title", "skills", "senior"])
 
     def test_an_array_waits_for_its_dependencies(self):
-        done, _, server = run({"role": {"type": "string", "enum": ["engineer", "designer"]},
-                               "skills": {**SKILLS, "depends_on": ["role"]}}, skills_server([True]))
+        done, sent, _ = run({"role": {"type": "string", "enum": ["engineer", "designer"]},
+                             "skills": {**SKILLS, "depends_on": ["role"]}}, skills_server(1))
         self.assertEqual(done.result, {"role": "engineer", "skills": ["Python"]})
-        self.assertIn('Dependency results (JSON):\n{"role": "engineer"}', server.continue_prompts[0])
+        self.assertIn('Dependency results (JSON):\n{"role": "engineer"}', item_prompts(sent)[0])
 
     def test_a_field_after_an_array_sees_the_finished_array(self):
-        done, sent, server = run({"skills": SKILLS, "count": {"type": "integer", "depends_on": ["skills"]}},
-                                 skills_server([True, True]))
+        done, sent, _ = run({"skills": SKILLS, "count": {"type": "integer", "depends_on": ["skills"]}},
+                            skills_server(2))
         self.assertEqual(done.result, {"skills": ["Python", "CUDA"], "count": 7})
         asked = [t for t in sent if 'Field: "count"' in t]
         self.assertIn('{"skills": ["Python", "CUDA"]}', asked[0])
-        self.assertGreater(sent.index(asked[0]), sent.index(server.continue_prompts[-1]))
+        self.assertGreater(sent.index(asked[0]), sent.index(item_prompts(sent)[-1]))
 
     def test_a_skipped_array_is_named_once(self):
         done, sent, _ = run({"kind": {"type": "string", "enum": ["invoice", "resume"]},
-                             "skills": {**SKILLS, "when": {"kind": "resume"}}}, skills_server([True]))
+                             "skills": {**SKILLS, "when": {"kind": "resume"}}}, skills_server(1))
         self.assertEqual((done.result, done.skipped), ({"kind": "invoice"}, ["skills"]))
-        self.assertFalse(any(CONTINUE_MARK in t for t in sent))
+        self.assertEqual(item_prompts(sent), [])
 
     def test_each_turn_extends_the_state_before_it(self):
-        _, sent, server = run({"skills": SKILLS}, skills_server([True, True, True]))
-        prompts = server.continue_prompts
+        _, sent, _ = run({"skills": SKILLS}, skills_server(3))
+        prompts = item_prompts(sent)
         self.assertEqual([current(p) for p in prompts],
                          [[], ["Python"], ["Python", "CUDA"], ["Python", "CUDA", "PyTorch"]])
         for before, after in zip(prompts, prompts[1:]):
             # Everything up to the array's closing bracket is the next turn's prefix.
             state = before[:before.rindex(STATE_MARK)] + STATE_MARK + _canonical_json(current(before))[:-1]
             self.assertTrue(after.startswith(state))
-        # The continue question is a branch: no later prompt carries it in its state.
+        # Each turn's question is a branch: no later prompt carries an earlier one.
+        for text in prompts:
+            self.assertEqual(text.count('Field: "item"'), 1)
+
+    def test_an_object_array_asks_what_comes_next_and_its_question_is_a_branch(self):
+        _, sent, server = run({"work_experience": WORK}, skills_server(2))
+        self.assertEqual(len(server.continue_prompts), 3)  # true, true, false
         for text in sent:
             self.assertLessEqual(text.count(CONTINUE_MARK), 1)
-            if 'Field: "item"' in text:
+            if any(f'Field: "{name}"' in text for name in WORK["items"]["properties"]):
                 self.assertNotIn(CONTINUE_MARK, text)
+        self.assertIn('Answer as {"append_item": "<label>"}.', server.continue_prompts[0])
+
+    def test_a_state_is_warmed_only_when_no_continue_question_cached_it(self):
+        # A continue question, or a string item, is alone in its batch and caches its prompt itself; the
+        # continue question's prompt starts with the state, so the properties forking from it after one
+        # need no warm-up. Below minItems no question is asked, and the state is warmed for them.
+        _, _, server = run({"skills": SKILLS}, skills_server(2))
+        self.assertEqual(server.requests("count"), [])
+        _, _, server = run({"work_experience": WORK}, skills_server(2))
+        self.assertEqual(server.requests("count"), [])
+        _, _, server = run({"work_experience": {**WORK, "minItems": 1}}, skills_server(1))
+        warm = server.requests("count")
+        self.assertEqual(len(warm), 1)
+        self.assertIn(STATE_MARK + "[]", warm[0]["text"])
 
     def test_committed_json_is_canonical(self):
         self.assertEqual(_canonical_json([{"b": 1, "a": True, "c": None, "d": 2.5, "e": "café"}]),
@@ -311,7 +353,7 @@ class ArrayTests(unittest.TestCase):
 
     def test_reasoning_inside_an_array_is_named_by_index(self):
         thinking = {**SKILLS, "items": {"type": "string", "thinking": True}}
-        done, _, _ = run({"skills": thinking}, skills_server([True]))
+        done, _, _ = run({"skills": thinking}, skills_server(1))
         self.assertEqual(done.result, {"skills": ["Python"]})
         self.assertEqual(list(done.thinking), ["skills[0]"])
 
