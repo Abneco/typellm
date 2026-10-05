@@ -69,6 +69,14 @@ class FakeServer(SGLangClient):
             out = [{"meta_info": {"prompt_tokens": 900}} for _ in texts]
         return out[0] if isinstance(payload["text"], str) else out
 
+    def generate_and_score(self, number_prefixes, patterns, number_max_tokens, text_prefixes, score_prefixes,
+                           candidate_ids, **options):
+        # One request on SGLang; two here, so the fakes that answer one kind of batch keep working.
+        # MergedRequestTests checks the request SGLang gets.
+        numbers, texts = self.generate_fields(number_prefixes, patterns, number_max_tokens, text_prefixes, **options)
+        scored, elapsed = self.score_candidates_batch(score_prefixes, candidate_ids)
+        return numbers, texts, scored, elapsed
+
     def requests(self, kind):
         def matches(p):
             params = p["sampling_params"]
@@ -348,3 +356,66 @@ class BatchedThinkingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MixedServer(SGLangClient):
+    """Answers a /generate batch as SGLang does, prompt by prompt: a prompt with candidate token ids
+    is scored, one without is generated under its own sampling params."""
+
+    def __init__(self):
+        super().__init__(model="fake")
+        self._chat_tokenizer = ThinkingTokenizer()
+        self._context_length_cache = 100_000
+        self.payloads = []
+
+    def _request(self, path, payload=None, *, allow_text=False):
+        if path == "/v1/tokenize":
+            return {"tokens": fake_tokenize(payload["prompt"])}
+        if path == "/v1/detokenize":
+            return {"text": fake_detokenize(payload["tokens"])}
+        self.payloads.append(payload)
+        texts = [payload["text"]] if isinstance(payload["text"], str) else payload["text"]
+        params = payload["sampling_params"]
+        params = params if isinstance(params, list) else [params] * len(texts)
+        ids = payload.get("token_ids_logprob") or [[]] * len(texts)
+        ids = [ids] * len(texts) if ids and isinstance(ids[0], int) else ids
+        out = []
+        for p, row in zip(params, ids):
+            if row:
+                out.append({"meta_info": {"prompt_tokens": 900, "output_token_ids_logprobs": [
+                    [[0.0 if t == row[0] else -9.0, t, "?"] for t in row]]}})
+            elif "regex" in p:
+                out.append({"text": " 7}" if is_number_pattern(p["regex"]) else ' "blue"}',
+                            "meta_info": {"prompt_tokens": 900, "finish_reason": {"type": "stop"}}})
+            else:
+                out.append({"meta_info": {"prompt_tokens": 900}})
+        return out[0] if isinstance(payload["text"], str) else out
+
+
+class MergedRequestTests(unittest.TestCase):
+    def test_a_layer_of_choices_and_open_fields_is_one_request(self):
+        client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
+        client.sglang = MixedServer()
+        done = client.generate(context="Receipt", questions={
+            "total": {"type": "number"}, "kind": {"type": "string", "enum": ["meal", "travel"]},
+            "note": {"type": "string"}, "paid": {"type": "boolean"}})
+        self.assertEqual(done.result, {"total": 7, "kind": "meal", "note": "blue", "paid": True})
+        work = [p for p in client.sglang.payloads if not all(
+            q.get("max_new_tokens") == 0 for q in (p["sampling_params"] if isinstance(p["sampling_params"], list)
+                                                   else [p["sampling_params"]]))]
+        [request] = work  # the warm-up aside, one request answers the layer
+        # The two choices first, each with its candidates; the number and the string after, without.
+        self.assertEqual(request["return_logprob"], [True, True, False, False])
+        self.assertEqual([ids == [] for ids in request["token_ids_logprob"]], [False, False, True, True])
+        self.assertIn('Field: "kind"', request["text"][0])
+        self.assertIn('Field: "total"', request["text"][2])
+        self.assertIn('Field: "note"', request["text"][3])
+
+    def test_a_layer_without_choices_or_without_open_fields_is_not_merged(self):
+        for questions in ({"total": {"type": "number"}, "note": {"type": "string"}},
+                          {"kind": {"type": "string", "enum": ["meal", "travel"]}, "paid": {"type": "boolean"}}):
+            with self.subTest(questions=list(questions)):
+                client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
+                client.sglang = MixedServer()
+                client.generate(context="Receipt", questions=questions)
+                self.assertFalse(any(isinstance(p.get("return_logprob"), list) for p in client.sglang.payloads))

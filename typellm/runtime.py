@@ -1268,19 +1268,24 @@ def _execute_batch_decisions(
     numeric_pending = [item for item in open_pending if item[1].numeric_type is not None]
     text_pending = [item for item in open_pending if item[1].text_type]
 
-    # A layer's numbers and strings decode side by side in one request.
+    # A layer's numbers and strings decode side by side in one request, and its choices are
+    # scored in that same request when the client can: one round trip for the layer, not two.
+    merged = bool((numeric_pending or text_pending) and prompts
+                  and callable(getattr(client, "generate_and_score", None)))
     if numeric_pending or text_pending:
         number_items = [(prompt + decision.answer_prefill, decision)
                         for _, decision, _, prompt in numeric_pending]
         number_seed = rng.randrange(2**31) if numeric_pending else 0
         text_seed = rng.randrange(2**31) if text_pending else 0
-        raw_numbers, values = client.generate_fields(
+        fields = (
             [prompt for prompt, _ in number_items],
             [numeric_pattern(d.numeric_type or "", numeric_max_digits, d.nullable) for _, d in number_items],
             # Digits, sign, point and the closing brace; tokens hold one or more characters.
             numeric_max_digits + 4,
             # From {"name": the model writes the string's first token, quote included.
             [prompt + decision.answer_prefill for _, decision, _, prompt in text_pending],
+        )
+        options = dict(
             temperature=0 if mode == "argmax" else temperature,
             number_seed=number_seed,
             text_seed=text_seed,
@@ -1288,6 +1293,11 @@ def _execute_batch_decisions(
             # A nullable string writes null or its text in the same request.
             nullable=[decision.nullable for _, decision, _, _ in text_pending],
         )
+        if merged:
+            raw_numbers, values, scored, elapsed = client.generate_and_score(
+                *fields, scoring_prompts, scoring_ids, **options)
+        else:
+            raw_numbers, values = client.generate_fields(*fields, **options)
         for (index, decision, messages, prompt), (value, _completed, generated_text) in zip(
                 numeric_pending, _parse_numbers(number_items, raw_numbers)):
             open_results[index] = (open_row(decision, value),
@@ -1297,7 +1307,8 @@ def _execute_batch_decisions(
             open_results[index] = (open_row(decision, value), completed)
 
     if prompts:
-        scored, elapsed = client.score_candidates_batch(scoring_prompts, scoring_ids)
+        if not merged:
+            scored, elapsed = client.score_candidates_batch(scoring_prompts, scoring_ids)
         grouped_scores = []
         offset = 0
         for orders in ordering_groups:
