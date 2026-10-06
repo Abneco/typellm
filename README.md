@@ -300,6 +300,24 @@ Items can be enum values, or objects:
 - Not supported: arrays of arrays, arrays inside objects, `return_probabilities`
   inside arrays, and `when` conditions that test an object or an array.
 
+For an input too long for one call, split it and carry the array on with
+`continue_from`: each call starts from the items so far and returns the whole
+array.
+
+```python
+items = []
+for part in parts:
+    response = client.generate(context=part, questions={
+        "employees": {**employees, "continue_from": items},
+    })
+    items = response.result["employees"]
+```
+
+- The items must match the `items` schema. They come back first and are never
+  changed; an item that repeats one of them is not added.
+- `minItems` and `maxItems` count them; the 50-item limit counts the items each
+  call adds.
+
 ## Thinking mode
 
 Thinking is off by default. Turn it on for the fields that need it; the others

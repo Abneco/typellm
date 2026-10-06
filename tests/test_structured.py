@@ -379,6 +379,72 @@ class ArrayTests(unittest.TestCase):
             with self.subTest(schema=schema), self.assertRaises((SchemaError, NotImplementedError)):
                 compile_json_schema({"type": "object", "properties": {"x": {"type": "boolean"}, "a": schema}})
 
+    def test_an_array_continues_from_the_items_it_is_given(self):
+        done, sent, _ = run({"skills": {**SKILLS, "continue_from": ["Python", "CUDA"]}}, skills_server(3))
+        # The given items come back first; the array goes on from them, as if it had generated them.
+        self.assertEqual(done.result, {"skills": ["Python", "CUDA", "PyTorch"]})
+        self.assertEqual([current(t) for t in item_prompts(sent)], [["Python", "CUDA"], ["Python", "CUDA", "PyTorch"]])
+
+    def test_an_object_array_continues_from_its_items(self):
+        jobs = [("Google", "Engineer", 2020, False), ("Stripe", "Senior Engineer", 2023, True)]
+        server = ScriptServer([True], texts=lambda prompt: jobs[len(current(prompt))][["company", "title"].index(field(prompt))],
+                              numbers=lambda prompt: jobs[len(current(prompt))][2],
+                              choose=lambda prompt, ids: (ids[0] if jobs[len(current(prompt))][3] else ids[1])
+                              if 'Field: "current"' in prompt else None)
+        google = {"company": "Google", "title": "Engineer", "start_year": 2020, "current": False}
+        done, _, server = run({"work_experience": {**WORK, "continue_from": [google]}}, server)
+        self.assertEqual(done.result, {"work_experience": [
+            google, {"company": "Stripe", "title": "Senior Engineer", "start_year": 2023, "current": True}]})
+        # The continue question saw the given item: asked with one item in, then with two.
+        self.assertEqual([len(current(t)) for t in server.continue_prompts], [1, 2])
+
+    def test_an_item_repeating_a_given_one_ends_the_array(self):
+        done, _, _ = run({"skills": {**SKILLS, "continue_from": ["Python"]}}, ScriptServer([], texts=lambda prompt: "Python"))
+        self.assertEqual(done.result, {"skills": ["Python"]})
+
+    def test_min_and_max_items_count_the_given_items(self):
+        done, sent, _ = run({"skills": {**SKILLS, "maxItems": 2, "continue_from": ["Python"]}}, skills_server(5))
+        self.assertEqual(done.result, {"skills": ["Python", "CUDA"]})
+        done, sent, _ = run({"skills": {**SKILLS, "maxItems": 2, "continue_from": ["Python", "CUDA"]}}, skills_server(5))
+        self.assertEqual(done.result, {"skills": ["Python", "CUDA"]})
+        self.assertEqual(item_prompts(sent), [])
+        done, sent, _ = run({"skills": {**SKILLS, "minItems": 2, "continue_from": ["Python"]}}, skills_server(0))
+        self.assertEqual(done.result, {"skills": ["Python", "CUDA"]})
+        self.assertEqual([NULL_MARK in t for t in item_prompts(sent)], [False, True])
+
+    def test_new_items_are_named_by_their_place_in_the_whole_array(self):
+        thinking = {**SKILLS, "items": {"type": "string", "thinking": True}, "continue_from": ["Python"]}
+        done, _, _ = run({"skills": thinking}, skills_server(2))
+        self.assertEqual(list(done.thinking), ["skills[1]"])
+
+    def test_continue_from_must_match_the_items(self):
+        nested = {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "where": {"type": "object", "properties": {"city": {"type": ["string", "null"]}}},
+            "size": {"type": "number", "enum": [1, 2.5]}}}}
+        for good in ([], [{"name": "a"}], [{"where": {"city": None}, "size": 1.0}], [{"size": 2.5}]):
+            with self.subTest(good=good):
+                compile_json_schema({"type": "object", "properties": {"a": {**nested, "continue_from": good}}})
+        for array, start in (
+            (SKILLS, "Python"),                                   # not a list
+            (SKILLS, [1]),
+            (SKILLS, [None]),                                     # a string item is never null
+            ({"type": "array", "items": {"type": "string", "enum": ["a"]}}, ["b"]),
+            ({"type": "array", "items": {"type": "integer"}}, [True]),
+            ({"type": "array", "items": {"type": "integer"}}, [1.5]),
+            ({"type": "array", "items": {"type": "number"}}, ["1"]),
+            ({"type": "array", "items": {"type": "boolean"}}, [1]),
+            ({**SKILLS, "maxItems": 1}, ["Python", "CUDA"]),
+            (nested, ["a"]),
+            (nested, [{"nope": 1}]),
+            (nested, [{"where": "Paris"}]),
+            (nested, [{"size": 3}]),
+            (nested, [{"size": True}]),
+        ):
+            with self.subTest(array=array, start=start), self.assertRaises(SchemaError):
+                compile_json_schema({"type": "object", "properties": {"a": {**array, "continue_from": start}}})
+        with self.assertRaises(SchemaError):  # only on an array
+            compile_json_schema({"type": "object", "properties": {"a": {"type": "string", "continue_from": []}}})
+
     def test_a_condition_cannot_test_an_array(self):
         with self.assertRaises(SchemaError):
             compile_json_schema({"type": "object", "properties": {

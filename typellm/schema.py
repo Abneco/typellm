@@ -71,6 +71,9 @@ class ArrayField:
     # As on Decision, for code that handles both: an array is never an effort question.
     effort_for: None = None
     effort_from: None = None
+    # continue_from: items a caller already has, from an earlier part of a long input. The array
+    # starts from them and returns them first; new items follow.
+    continue_from: tuple[Any, ...] = ()
 
     @property
     def path(self) -> tuple[str, ...]:
@@ -233,7 +236,7 @@ def _check_required(schema: Mapping[str, Any], properties: Mapping[str, Any], la
 
 # Keys of one kind of schema that mean nothing, or something else, on another.
 _OBJECT_ONLY = ("properties",)
-_ARRAY_ONLY = ("items", "minItems", "maxItems")
+_ARRAY_ONLY = ("items", "minItems", "maxItems", "continue_from")
 _SCALAR_ONLY = ("enum", "permutations", "return_probabilities", "thinking", "thinking_effort", "thinking_budget")
 
 
@@ -368,8 +371,70 @@ def _array(name: str, field: Mapping[str, Any]) -> ArrayField:
             nullable = replace(main, nullable=True, scope=OPEN_ITEM_SCOPE,
                                choices=main.choices + ((None,) if main.choices else ()))
             open_items = tuple(nullable if decision is main else decision for decision in decisions)
-        return ArrayField(name, question, tuple(decisions), False, min_items, max_items, open_items=open_items)
-    return ArrayField(name, question, tuple(decisions), True, min_items, max_items)
+        start = _continue_from(name, field, decisions, item_object=False, max_items=max_items)
+        return ArrayField(name, question, tuple(decisions), False, min_items, max_items, open_items=open_items,
+                          continue_from=start)
+    start = _continue_from(name, field, decisions, item_object=True, max_items=max_items)
+    return ArrayField(name, question, tuple(decisions), True, min_items, max_items, continue_from=start)
+
+
+def _continue_from(name: str, field: Mapping[str, Any], decisions: Sequence[Decision], *, item_object: bool,
+                   max_items: int | None) -> tuple[Any, ...]:
+    """The items an array continues from, each checked against its items' schema."""
+    if "continue_from" not in field:
+        return ()
+    start = field["continue_from"]
+    if not isinstance(start, list):
+        raise SchemaError(f"continue_from for {name!r} must be a list of items")
+    if max_items is not None and len(start) > max_items:
+        raise SchemaError(f"continue_from for {name!r} has {len(start)} items; its maxItems is {max_items}")
+    answers = [decision for decision in decisions if decision.effort_for is None]
+    for index, item in enumerate(start):
+        label = f"{name}.continue_from[{index}]"
+        if item_object:
+            _check_object_item(label, item, {decision.path: decision for decision in answers}, ())
+        else:
+            _check_value(label, item, answers[0])
+    return tuple(start)
+
+
+def _check_object_item(label: str, value: Any, leaves: Mapping[tuple[str, ...], Decision],
+                       at: tuple[str, ...]) -> None:
+    """An object item: known properties only, each a valid value. A property may be missing, as a
+    "when" may have skipped it."""
+    if not isinstance(value, Mapping):
+        raise SchemaError(f"{label} must be an object")
+    for key, item in value.items():
+        path = at + (key,)
+        if path in leaves:
+            _check_value(f"{label}.{key}", item, leaves[path])
+        elif any(leaf[:len(path)] == path for leaf in leaves):
+            _check_object_item(f"{label}.{key}", item, leaves, path)
+        else:
+            raise SchemaError(f"{label} has no property {key!r}")
+
+
+def _check_value(label: str, value: Any, decision: Decision) -> None:
+    """A value the decision could have answered."""
+    if value is None:
+        if not decision.nullable:
+            raise SchemaError(f"{label} cannot be null")
+        return
+    if decision.choices:
+        # Compared as JSON does: true is not 1, and 1 is 1.0.
+        if not any(choice == value and (type(choice) is type(value)
+                                        or (_is_finite_number(choice) and _is_finite_number(value)))
+                   for choice in decision.choices):
+            raise SchemaError(f"{label} is not one of the choices {list(decision.choices)!r}")
+    elif decision.text_type:
+        if not isinstance(value, str):
+            raise SchemaError(f"{label} must be a string")
+    elif decision.numeric_type == "integer":
+        if type(value) is not int:
+            raise SchemaError(f"{label} must be an integer")
+    elif decision.numeric_type == "number":
+        if not _is_finite_number(value):
+            raise SchemaError(f"{label} must be a number")
 
 
 def _link_array(array: ArrayField, field: Mapping[str, Any], scope, linked: Sequence[Decision]) -> ArrayField:
