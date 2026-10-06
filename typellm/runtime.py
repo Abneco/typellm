@@ -180,6 +180,8 @@ class ArrayChoice:
     effort_for: None = None
     effort_from: None = None
     return_probabilities: bool = False
+    # Items the caller already has: the array starts from them (schema's continue_from).
+    continue_from: tuple[Any, ...] = ()
 
     @property
     def path(self) -> tuple[str, ...]:
@@ -418,6 +420,7 @@ class TypeLLMClient:
                     when=array.when,
                     dependency_groups=array.dependency_groups,
                     open_items=None if array.open_items is None else tuple(bind(item) for item in array.open_items),
+                    continue_from=array.continue_from,
                 )
 
             return [bind_array(item) if isinstance(item, ArrayField) else bind(item) for item in decisions]
@@ -1057,16 +1060,20 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
     side by side. Each item is committed to the state. An item already in the array is not added
     again: with argmax the next turn would give it again, so the array ends; sampling may try again
     a few times. The array also ends at maxItems, or at MAX_ARRAY_ITEMS without one.
+
+    An array that continues from items (continue_from) starts with them committed: every turn sees
+    them, an item repeating one ends the array, and they come back first. minItems and maxItems count
+    them; MAX_ARRAY_ITEMS counts the items this call adds.
     """
     specification = _array_specification(array, dependency_values)
-    items: list[Any] = []
-    committed: set[str] = set()
+    items: list[Any] = list(array.continue_from)
+    committed: set[str] = {_canonical_json(item) for item in items}
     prompts: list[str] = []
     thinking: dict[str, str] = {}
     efforts: dict[str, str] = {}
     skipped: list[str] = []
     retries = 0 if mode == "argmax" else DUPLICATE_RETRIES
-    limit = MAX_ARRAY_ITEMS if array.max_items is None else array.max_items
+    limit = len(items) + MAX_ARRAY_ITEMS if array.max_items is None else array.max_items
     while len(items) < limit:
         state = _array_state(context, specification, items)
         may_end = len(items) >= array.min_items
