@@ -667,7 +667,8 @@ def _score(name: str, label: str, question: str, field: Mapping[str, Any], field
     """A score: a number from ordered "levels", [{"label": ..., "description": ...}, ...], lowest first.
 
     It is asked as a choice among the levels' labels; its value is the probability-weighted average
-    of their indices, 0 to n - 1. The levels keep their order unless permutations says otherwise.
+    of their indices, 0 to n - 1. The levels keep their order: the order is the scale, so a score
+    takes no permutations.
     """
     if field_type != "number" or nullable:
         raise SchemaError(f'levels for {label!r} need "type": "number"')
@@ -693,15 +694,10 @@ def _score(name: str, label: str, question: str, field: Mapping[str, Any], field
     return_probabilities = field.get("return_probabilities", False)
     if type(return_probabilities) is not bool:
         raise SchemaError(f"return_probabilities for {label!r} must be a boolean")
-    permutations = field.get("permutations", 1)
-    if not (permutations in ("auto", "all") or type(permutations) is int and permutations > 0):
-        raise SchemaError(f"permutations for {label!r} must be 'auto', 'all' or a positive integer")
-    if permutations != "auto":
-        count = math.factorial(len(labels))
-        if (count if permutations == "all" else min(permutations, count)) > MAX_PERMUTATIONS:
-            raise SchemaError(f"permutations for {label!r} exceeds {MAX_PERMUTATIONS}; use a smaller integer budget")
+    if "permutations" in field:
+        raise SchemaError(f"{label!r} is a score: its levels keep their order, so it takes no permutations")
     return Decision(name, question, tuple(labels), "Choice", return_probabilities=return_probabilities,
-                    permutations=permutations, descriptions=tuple(descriptions), levels=tuple(labels))
+                    permutations=1, descriptions=tuple(descriptions), levels=tuple(labels))
 
 
 def _choices(label: str, field: Mapping[str, Any]) -> tuple[list[Any], tuple[tuple[Any, str], ...]]:

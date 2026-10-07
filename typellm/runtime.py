@@ -931,10 +931,11 @@ def _choice_orderings(decision, rng):
     """Rebind values to fixed control labels, sampling ranks without enumeration."""
     labels = list(decision.choices)
     values = list(decision.choices.values())
+    # Orders start from a canonical one, so the orders used do not depend on the order the enum
+    # was written in.
+    canonical = sorted(range(len(values)), key=lambda i: json.dumps(values[i]))
     if decision.permutations == "auto" and len(values) > 1:
-        # Start from a canonical order so the result does not depend on the
-        # order the enum was written in, then balance positions and neighbours.
-        canonical = sorted(range(len(values)), key=lambda i: json.dumps(values[i]))
+        # Balance positions and neighbours.
         orders = [tuple(canonical[i] for i in row) for row in _balanced_orders(len(values))]
         return [(replace(decision, choices=dict(zip(labels, (values[i] for i in order))),
                          permutations=1), order) for order in orders]
@@ -961,7 +962,7 @@ def _choice_orderings(decision, rng):
             while available:
                 index, rank = divmod(rank, math.factorial(len(available) - 1))
                 order.append(available.pop(index))
-            orders.append(tuple(order))
+            orders.append(tuple(canonical[i] for i in order))
     return [(replace(decision, choices=dict(zip(labels, (values[i] for i in order))),
                      permutations=1), order) for order in orders]
 

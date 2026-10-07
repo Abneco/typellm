@@ -549,7 +549,7 @@ probability-weighted average of their indices, so it can fall between levels:
 - Levels are numbered from 0. Without `return_probabilities`, the score is a plain number.
 - A score's `confidence` counts how far its probability sits from the most likely
   level: being torn between neighbouring levels lowers it less than between the ends.
-- The levels keep their order; set `permutations` to average over orders anyway.
+- The levels keep their order, since the order is the scale: a score takes no `permutations`.
 - `when` compares a score with `gt`, `gte`, `lt` or `lte`. Scores are not supported
   inside arrays.
 
