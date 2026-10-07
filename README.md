@@ -172,6 +172,25 @@ TypeLLM supports finite decisions, numeric fields, and free text:
 
 Enum choices support `string`, `integer`, and `number` types, with at most 24 values. The declared `type` validates the candidate values.
 
+To say what each choice means, write `choices` in place of `enum`:
+
+```python
+"queue": {
+    "type": "string",
+    "instructions": "Which team should handle the ticket?",
+    "choices": [
+        {"value": "billing", "description": "Payments, invoices, and refunds."},
+        {"value": "technical", "description": "Problems using the product."},
+        {"value": "shipping", "description": "Delivery and tracking."},
+        {"value": "other", "description": "Requests outside these categories."},
+    ],
+}
+# {"queue": "billing"}
+```
+
+The values follow the rules of `enum`, and the answer is one of them. A
+description is optional.
+
 A string without `enum` generates free text:
 
 ```python
@@ -494,12 +513,45 @@ response = client.generate(
             "travel": 0.93,
             "equipment": 0.03,
         },
+        "confidence": 0.9,
     }
 }
 ```
 
-Only opted-in fields return `value` and `probabilities`; other fields return plain values.
-The option is not supported on open Numeric or Text fields.
+Only opted-in fields return `value`, `probabilities` and `confidence`; other fields
+return plain values. The option is not supported on open Numeric or Text fields.
+
+`confidence` runs from 0, an even spread, to 1, certainty: `(p_max - 1/n) / (1 - 1/n)`
+for `n` choices, how far the top probability sits above an even split. Use it to
+act on sure answers and send unsure ones for review.
+
+### Scores
+
+A score rates the input against ordered `levels`, lowest first, and returns the
+probability-weighted average of their indices, so it can fall between levels:
+
+```python
+"severity": {
+    "type": "number",
+    "instructions": "How severe is this issue?",
+    "levels": [
+        {"label": "Cosmetic", "description": "Appearance only; no lost functionality."},
+        {"label": "Workaround available", "description": "A task fails, but another way works."},
+        {"label": "Fully blocked", "description": "A task fails with no workaround."},
+    ],
+    "return_probabilities": True,
+}
+# {"severity": {"value": 1.1,
+#   "probabilities": {"Cosmetic": 0.1, "Workaround available": 0.7, "Fully blocked": 0.2},
+#   "confidence": 0.55}}
+```
+
+- Levels are numbered from 0. Without `return_probabilities`, the score is a plain number.
+- A score's `confidence` counts how far its probability sits from the most likely
+  level: being torn between neighbouring levels lowers it less than between the ends.
+- The levels keep their order; set `permutations` to average over orders anyway.
+- `when` compares a score with `gt`, `gte`, `lt` or `lte`. Scores are not supported
+  inside arrays.
 
 `temperature` is 0 by default: each field gets its most likely answer. Above 0,
 TypeLLM samples at that temperature:

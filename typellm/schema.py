@@ -50,6 +50,11 @@ class Decision:
     # depends_on, grouped by what was named: an object's properties are one group, skipped only
     # when all of them are. None: each dependency is its own group.
     dependency_groups: tuple[tuple[str, ...], ...] | None = None
+    # A choice's description by value, from "choices": ((value, description), ...); empty for an enum.
+    descriptions: tuple[tuple[Any, str], ...] = ()
+    # A score's ordered levels, lowest first: its choices are their labels, and its value is the
+    # probability-weighted average of their indices. Empty for every other field.
+    levels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -237,7 +242,7 @@ def _check_required(schema: Mapping[str, Any], properties: Mapping[str, Any], la
 # Keys of one kind of schema that mean nothing, or something else, on another.
 _OBJECT_ONLY = ("properties",)
 _ARRAY_ONLY = ("items", "minItems", "maxItems", "continue_from")
-_SCALAR_ONLY = ("enum", "permutations", "return_probabilities", "thinking", "thinking_effort", "thinking_budget")
+_SCALAR_ONLY = ("enum", "choices", "levels", "permutations", "return_probabilities", "thinking", "thinking_effort", "thinking_budget")
 
 
 def _kind(label: str, field: Mapping[str, Any]) -> str:
@@ -274,7 +279,7 @@ def _question(label: str, field: Mapping[str, Any], default: str) -> str:
 
 # Keys an array item's properties do not take: the item is written whole, in one request.
 _NOT_IN_ITEMS = ("thinking", "thinking_effort", "thinking_budget", "depends_on", "when", "permutations",
-                 "return_probabilities")
+                 "return_probabilities", "levels")
 
 
 def _object_entries(path: tuple[str, ...], field: Mapping[str, Any], label: str, *, inside_array: bool,
@@ -365,8 +370,9 @@ def _array(name: str, field: Mapping[str, Any]) -> ArrayField:
             if key in items:
                 raise SchemaError(f"{key} is not supported on the items of {name!r}; set it on the array")
         item = _scalar("item", label, items)
-        if item.return_probabilities:
-            raise SchemaError(f"return_probabilities is not supported inside arrays (on {label!r})")
+        if item.return_probabilities or item.levels:
+            key = "levels" if item.levels else "return_probabilities"
+            raise SchemaError(f"{key} is not supported inside arrays (on {label!r})")
         item_question = _question(label, items, "One item of the array.")
         decisions = [replace(decision, scope=ITEM_SCOPE + decision.scope) if decision.effort_for is None
                      else decision
@@ -553,7 +559,12 @@ def _scalar(name: str, label: str, field: Mapping[str, Any]) -> Decision:
         if len(field_type) != 2 or len(kinds) != 1 or not isinstance(kinds[0], str):
             raise SchemaError(f'type for {label!r} must be one type or [type, "null"]')
         field_type, nullable = kinds[0], True
+    if "levels" in field:
+        return _score(name, label, question, field, field_type, nullable)
     enum = field.get("enum")
+    descriptions: tuple[tuple[Any, str], ...] = ()
+    if "choices" in field:
+        enum, descriptions = _choices(label, field)
     permutations = field.get("permutations", 1)
     if "permutations" in field:
         # A boolean's choices are true and false, enum or not.
@@ -648,7 +659,70 @@ def _scalar(name: str, label: str, field: Mapping[str, Any]) -> Decision:
     if _has_duplicates(values):
         raise SchemaError(f"enum for {label!r} contains duplicate values")
     return Decision(name, question, tuple(values), syntax, return_probabilities=return_probabilities,
-                    permutations=permutations, nullable=nullable)
+                    permutations=permutations, nullable=nullable, descriptions=descriptions)
+
+
+def _score(name: str, label: str, question: str, field: Mapping[str, Any], field_type: Any,
+           nullable: bool) -> Decision:
+    """A score: a number from ordered "levels", [{"label": ..., "description": ...}, ...], lowest first.
+
+    It is asked as a choice among the levels' labels; its value is the probability-weighted average
+    of their indices, 0 to n - 1. The levels keep their order unless permutations says otherwise.
+    """
+    if field_type != "number" or nullable:
+        raise SchemaError(f'levels for {label!r} need "type": "number"')
+    for key in ("enum", "choices"):
+        if key in field:
+            raise SchemaError(f"{label!r} takes levels or {key}, not both")
+    levels = field["levels"]
+    if not isinstance(levels, list) or not 2 <= len(levels) <= MAX_ENUM_CHOICES:
+        raise SchemaError(f"levels for {label!r} must be a list of 2 to {MAX_ENUM_CHOICES} levels")
+    labels, descriptions = [], []
+    for index, level in enumerate(levels):
+        if not isinstance(level, Mapping) or set(level) - {"label", "description"} \
+                or not isinstance(level.get("label"), str) or not level["label"].strip():
+            raise SchemaError(f'levels[{index}] for {label!r} must be {{"label": "...", "description": "..."}}')
+        description = level.get("description")
+        if description is not None and (not isinstance(description, str) or not description.strip()):
+            raise SchemaError(f"levels[{index}].description for {label!r} must be a non-empty string")
+        labels.append(level["label"].strip())
+        if description is not None:
+            descriptions.append((labels[-1], description.strip()))
+    if len(set(labels)) != len(labels):
+        raise SchemaError(f"levels for {label!r} have duplicate labels")
+    return_probabilities = field.get("return_probabilities", False)
+    if type(return_probabilities) is not bool:
+        raise SchemaError(f"return_probabilities for {label!r} must be a boolean")
+    permutations = field.get("permutations", 1)
+    if not (permutations in ("auto", "all") or type(permutations) is int and permutations > 0):
+        raise SchemaError(f"permutations for {label!r} must be 'auto', 'all' or a positive integer")
+    if permutations != "auto":
+        count = math.factorial(len(labels))
+        if (count if permutations == "all" else min(permutations, count)) > MAX_PERMUTATIONS:
+            raise SchemaError(f"permutations for {label!r} exceeds {MAX_PERMUTATIONS}; use a smaller integer budget")
+    return Decision(name, question, tuple(labels), "Choice", return_probabilities=return_probabilities,
+                    permutations=permutations, descriptions=tuple(descriptions), levels=tuple(labels))
+
+
+def _choices(label: str, field: Mapping[str, Any]) -> tuple[list[Any], tuple[tuple[Any, str], ...]]:
+    """An enum written as "choices": [{"value": ..., "description": ...}, ...]: its values, and the
+    descriptions given. The values are then checked as an enum's are."""
+    if "enum" in field:
+        raise SchemaError(f"{label!r} takes enum or choices, not both")
+    choices = field["choices"]
+    if not isinstance(choices, list) or not choices:
+        raise SchemaError(f"choices for {label!r} must be a non-empty list")
+    values, descriptions = [], []
+    for index, choice in enumerate(choices):
+        if not isinstance(choice, Mapping) or "value" not in choice or set(choice) - {"value", "description"}:
+            raise SchemaError(f"choices[{index}] for {label!r} must be {{\"value\": ..., \"description\": ...}}")
+        description = choice.get("description")
+        if description is not None and (not isinstance(description, str) or not description.strip()):
+            raise SchemaError(f"choices[{index}].description for {label!r} must be a non-empty string")
+        values.append(choice["value"])
+        if description is not None:
+            descriptions.append((choice["value"], description.strip()))
+    return values, tuple(descriptions)
 
 
 # "when" operators. A bare value means {"in": [value]}, and a list {"in": list}.
@@ -659,7 +733,7 @@ OPERATORS = ("in", "not_in", "ne", *COMPARISONS)
 
 def _numeric(decision: Decision) -> bool:
     """An integer or number field, open or with a numeric enum."""
-    if decision.numeric_type is not None:
+    if decision.numeric_type is not None or decision.levels:
         return True
     values = [value for value in decision.choices if value is not None]
     return decision.syntax == "Choice" and bool(values) and all(_is_finite_number(v) for v in values)
@@ -667,6 +741,8 @@ def _numeric(decision: Decision) -> bool:
 
 def _can_answer(decision: Decision, value: Any) -> bool:
     """Whether the field can give this answer, so a condition on it can ever hold."""
+    if decision.levels:
+        return False  # a score is a weighted average: compare it, do not match it
     if decision.choices:
         return any(_same_value(value, choice) for choice in decision.choices)
     if value is None:

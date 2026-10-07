@@ -86,6 +86,10 @@ class Choice:
     scope: str = ""
     # depends_on grouped by what was named: a group is skipped only when all of it is.
     dependency_groups: tuple[tuple[str, ...], ...] | None = None
+    # A choice's description by value, from "choices"; empty for an enum.
+    descriptions: tuple[tuple[Any, str], ...] = ()
+    # A score's levels, lowest first; its value is the weighted average of their indices.
+    levels: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.choices and self.numeric_type is None and not self.text_type:
@@ -143,6 +147,8 @@ class Choice:
             kind = f"string{or_null}"
         elif self.numeric_type is not None:
             kind = self.numeric_type + or_null
+        elif self.levels:
+            kind = "score, from the lowest level to the highest"
         else:
             kind = "boolean" if self.syntax == "Bool" else "choice"
         lines.append(f"Type: {kind}")
@@ -158,7 +164,15 @@ class Choice:
         else:
             # Say which side is the label, and answer under "label", not the field's name: after
             # '{"type": "' a model writes the field's value, such as "C", which may be another choice's label.
-            lines.append(f"Choices (label: value): {json.dumps(dict(self.choices), ensure_ascii=False)}")
+            if self.descriptions:
+                # One line a choice, its description after its value, in the order the labels have now.
+                said = {_value_key(value): text for value, text in self.descriptions}
+                lines.append("Choices (label: value, description):")
+                lines += [f"{label}: {json.dumps(value, ensure_ascii=False)}"
+                          + (f" ({said[_value_key(value)]})" if _value_key(value) in said else "")
+                          for label, value in self.choices.items()]
+            else:
+                lines.append(f"Choices (label: value): {json.dumps(dict(self.choices), ensure_ascii=False)}")
             answer = 'Answer as {"label": "<label>"}.'
         lines.append(answer)
         return "\n".join(lines)
@@ -407,6 +421,8 @@ class TypeLLMClient:
                     shown_name=item.shown_name,
                     scope=item.scope,
                     dependency_groups=item.dependency_groups,
+                    descriptions=item.descriptions,
+                    levels=item.levels,
                 )
 
             def bind_array(array):
@@ -640,9 +656,10 @@ class TypeLLMClient:
             # enum holding both "None" and null gets one entry.
             for name, question in questions.items():
                 answer = result.get(name)
-                if isinstance(answer, dict):  # a return_probabilities answer
+                if isinstance(answer, dict) and "probabilities" in answer:  # a return_probabilities answer
+                    given = question.get("enum") or [choice.get("value") for choice in question.get("choices") or []]
                     values = {json.dumps(value) if type(value) is bool else str(value): value
-                              for value in question.get("enum") or (True, False, None)}
+                              for value in given or (True, False, None)}
                     answer["probabilities"] = {values.get(key, key): probability
                                                for key, probability in answer["probabilities"].items()}
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -693,13 +710,45 @@ class TypeLLMClient:
             attempt += 1
 
 
+def _level_probabilities(decision: Choice, probabilities: Mapping[str, float]) -> list[float]:
+    """A score's probabilities by level index, from its probabilities by label."""
+    by_level = {decision.choices[label]: probability for label, probability in probabilities.items()}
+    return [by_level.get(level, 0.0) for level in decision.levels]
+
+
+def _score_value(decision: Choice, probabilities: Mapping[str, float]) -> float:
+    """A score: the probability-weighted average of its levels' indices, 0 to n - 1."""
+    return sum(index * p for index, p in enumerate(_level_probabilities(decision, probabilities)))
+
+
+def _confidence(decision: Choice, probabilities: Mapping[str, float]) -> float:
+    """How sure an answer is, 0 for an even spread and 1 for certainty.
+
+    A choice: (p_max - 1/n) / (1 - 1/n), how far its top probability sits above an even split.
+    A score: 1 - (expected distance from the most likely level) / (the same for an even spread,
+    from the middle level), floored at 0: probability on a neighbouring level costs less than on a
+    far one.
+    """
+    if decision.levels:
+        levels = _level_probabilities(decision, probabilities)
+        n = len(levels)
+        top = max(range(n), key=lambda index: levels[index])
+        spread = sum(p * abs(index - top) for index, p in enumerate(levels))
+        even = sum(abs(index - (n - 1) / 2) for index in range(n)) / n
+        return max(0.0, 1 - spread / even)
+    n = len(probabilities)
+    return (max(probabilities.values()) - 1 / n) / (1 - 1 / n)
+
+
 def _answer(decision: Choice, row: Mapping[str, Any]) -> Any:
-    """A row's value as the result gives it: with its probabilities when the field asks for them."""
+    """A row's value as the result gives it: with its probabilities and confidence when the field asks
+    for them."""
     if not decision.return_probabilities:
         return row["value"]
     return {"value": row["value"],
             "probabilities": {decision.choices[label]: probability
-                              for label, probability in row["probabilities"].items()}}
+                              for label, probability in row["probabilities"].items()},
+            "confidence": _confidence(decision, row["probabilities"])}
 
 
 def _assemble(decisions: Sequence[Any], rows: Sequence[dict | None], prefix: str = ""
@@ -1001,6 +1050,11 @@ def _execute_dependency_decisions(
             [prompts_by_name[d.name] for d in decisions])
 
 
+def _value_key(value: Any) -> str:
+    """A choice's value as a key: 1 and 1.0 alike, true and 1 apart."""
+    return json.dumps(float(value) if type(value) in (int, float) else value)
+
+
 def _describe_item(decision: Choice) -> str:
     """An item's or a property's type in an array's specification."""
     or_null = " or null" if decision.nullable else ""
@@ -1010,7 +1064,12 @@ def _describe_item(decision: Choice) -> str:
         return decision.numeric_type + or_null
     if decision.syntax == "Bool":
         return "boolean" + or_null
-    return "one of " + json.dumps(list(decision.choices.values()), ensure_ascii=False)
+    if not decision.descriptions:
+        return "one of " + json.dumps(list(decision.choices.values()), ensure_ascii=False)
+    said = {_value_key(value): text for value, text in decision.descriptions}
+    return "one of " + ", ".join(json.dumps(value, ensure_ascii=False)
+                                 + (f" ({said[_value_key(value)]})" if _value_key(value) in said else "")
+                                 for value in decision.choices.values())
 
 
 def _whole_items(array: ArrayChoice) -> bool:
@@ -1447,6 +1506,8 @@ def _execute_batch_decisions(
             elapsed,
             meta.get("cached_tokens"),
         )
+        if decision.levels:
+            semantic_value = _score_value(decision, probabilities)
         results.append(
             {
                 "name": decision.name,
