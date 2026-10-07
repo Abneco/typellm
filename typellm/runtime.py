@@ -1044,58 +1044,6 @@ def _item_line(decision: Choice) -> str:
     return f"- {name} ({_describe_item(decision)}){said}"
 
 
-def _item_probabilities(client, state: str, item: Mapping[str, Any], decisions: Sequence[Choice],
-                        image_count: int) -> dict[tuple[str, ...], dict[Any, float]]:
-    """Each choice's probabilities in an item written whole, for the choices that ask for them.
-
-    Each is asked as a field outside an array is, labels and all, after the item's other properties,
-    so the probabilities hold for this item. One request scores them all.
-    """
-    asked = [decision for decision in decisions if decision.choices and decision.return_probabilities]
-    if not asked:
-        return {}
-    shared = [{"role": "user", "content": _user_content(state.rstrip(), image_count)}]
-    prefixes, ids = [], []
-    for decision in asked:
-        others = json.loads(json.dumps(item))
-        *parents, leaf = _path(decision)
-        node = others
-        for parent in parents:
-            node = node[parent]
-        del node[leaf]
-        question = ("The next item of the array above is this object, without one property:\n"
-                    + json.dumps(others, ensure_ascii=False) + "\nChoose that property.\n"
-                    + replace(decision, scope="").opening_text())
-        prefixes.append(client.render_chat(shared + [{"role": "user", "content": question}],
-                                           add_generation_prompt=True) + decision.label_prefill)
-        ids.append([client.single_token(label)[0] for label in decision.choices])
-    scored, _ = client.score_candidates_batch(prefixes, ids)
-    out = {}
-    for decision, label_ids, (scores, _meta) in zip(asked, ids, scored):
-        logprobs = {label: scores.get(token_id, float("-inf")) for label, token_id in zip(decision.choices, label_ids)}
-        if all(value == float("-inf") for value in logprobs.values()):
-            raise SGLangError(f"no scores for the labels of {'.'.join(_path(decision))!r}")
-        out[_path(decision)] = {decision.choices[label]: p for label, p in candidate_softmax(logprobs).items()}
-    return out
-
-
-def _plain(item: Any, decisions: Sequence[Choice]) -> Any:
-    """An object item with each {"value": ..., "probabilities": ...} of its choices replaced by the value."""
-    if not isinstance(item, Mapping):
-        return item
-    out = json.loads(json.dumps(item))
-    for decision in decisions:
-        if not getattr(decision, "return_probabilities", False):
-            continue
-        *parents, leaf = _path(decision)
-        node = out
-        for parent in parents:
-            node = node.get(parent) if isinstance(node, Mapping) else None
-        if isinstance(node, dict) and isinstance(node.get(leaf), Mapping) and "value" in node[leaf]:
-            node[leaf] = node[leaf]["value"]
-    return out
-
-
 def _object_grammar(decisions: Sequence[Choice]) -> dict[str, Any]:
     """The JSON Schema of an object item: its properties by path, nested objects included, in order."""
     tree: dict[str, Any] = {}
@@ -1132,15 +1080,7 @@ def _generate_whole_item(client, state: str, array: ArrayChoice, temperature: fl
     value = client.generate_json(prompt, schema, budget, temperature=temperature or 0, seed=seed)
     if not isinstance(value, Mapping) or list(value) != names:
         raise SGLangError(f"array {array.name!r}: an item did not match its schema")
-    item = dict(value)
-    # A choice that asks for probabilities answers as a field does: {"value": ..., "probabilities": {...}}.
-    for path, probabilities in _item_probabilities(client, state, value, array.items, image_count).items():
-        *parents, leaf = path
-        node = item
-        for parent in parents:
-            node = node[parent]
-        node[leaf] = {"value": node[leaf], "probabilities": probabilities}
-    return item, prompt
+    return dict(value), prompt
 
 
 def _array_specification(array: ArrayChoice, dependency_values: Mapping[str, Any]) -> str:
@@ -1199,10 +1139,7 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
     them; MAX_ARRAY_ITEMS counts the items this call adds.
     """
     specification = _array_specification(array, dependency_values)
-    # What the caller gets back, and the plain items the state shows: a choice that returns
-    # probabilities is {"value": ..., "probabilities": ...} in the one and its value in the other.
-    returned: list[Any] = list(array.continue_from)
-    items: list[Any] = [_plain(item, array.items) for item in returned]
+    items: list[Any] = list(array.continue_from)
     committed: set[str] = {_canonical_json(item) for item in items}
     prompts: list[str] = []
     thinking: dict[str, str] = {}
@@ -1243,7 +1180,6 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
             # A scalar item is named by its index alone, "skills[0]".
             item_thinking = {item_prefix: text for text in item_thinking.values()}
             item_efforts = {item_prefix: effort for effort in item_efforts.values()}
-        shown, item = item, _plain(item, array.items) if array.item_object else item
         key = _canonical_json(item)
         if key in committed:
             LOG.info("array=%s duplicate item %s", array.name, key)
@@ -1253,11 +1189,10 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
             continue
         committed.add(key)
         items.append(item)
-        returned.append(shown)
         thinking.update(item_thinking)
         efforts.update(item_efforts)
         skipped += item_skipped
-    return {"name": array.name, "question": array.question, "label": None, "value": returned,
+    return {"name": array.name, "question": array.question, "label": None, "value": items,
             "probabilities": None, "thinking": thinking, "thinking_effort": efforts, "skipped": skipped,
             "prompts": prompts}
 

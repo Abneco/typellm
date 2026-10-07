@@ -292,16 +292,15 @@ Items can be enum values, or objects:
 - A property takes what a field takes: `instructions`, `enum`, `thinking`, and
   `depends_on` or `when` on other properties of the same object. Objects can
   hold objects. A field that `depends_on` an object or an array sees all of it.
-- Inside an array's items, properties take `instructions`, `enum`, null and
-  `return_probabilities`, but not `thinking`, `depends_on` or `when`.
+- Inside an array's items, properties take `instructions`, `enum` and null, but
+  not `thinking`, `depends_on`, `when` or `return_probabilities`.
 - `minItems` and `maxItems` bound an array. An array holds at most 50 items,
   each distinct from the others.
 - An object or an array can itself have `depends_on` and `when`; skipped, it is
   listed once in `response.skipped`. A property a `when` skipped is listed by
   its path, such as `"person.employer"`.
 - Not supported: arrays of arrays, arrays inside objects, `return_probabilities`
-  on an array of strings, numbers or choices, and `when` conditions that test an
-  object or an array.
+  inside arrays, and `when` conditions that test an object or an array.
 
 For an input too long for one call, split it and carry the array on with
 `continue_from`: each call starts from the items so far and returns the whole

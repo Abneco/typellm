@@ -273,7 +273,8 @@ def _question(label: str, field: Mapping[str, Any], default: str) -> str:
 
 
 # Keys an array item's properties do not take: the item is written whole, in one request.
-_NOT_IN_ITEMS = ("thinking", "thinking_effort", "thinking_budget", "depends_on", "when", "permutations")
+_NOT_IN_ITEMS = ("thinking", "thinking_effort", "thinking_budget", "depends_on", "when", "permutations",
+                 "return_probabilities")
 
 
 def _object_entries(path: tuple[str, ...], field: Mapping[str, Any], label: str, *, inside_array: bool,
@@ -414,11 +415,7 @@ def _check_object_item(label: str, value: Any, leaves: Mapping[tuple[str, ...], 
     for key, item in value.items():
         path = at + (key,)
         if path in leaves:
-            decision = leaves[path]
-            # An item as a call returned it: a choice that returns probabilities is {"value", "probabilities"}.
-            if decision.return_probabilities and isinstance(item, Mapping) and set(item) == {"value", "probabilities"}:
-                item = item["value"]
-            _check_value(f"{label}.{key}", item, decision)
+            _check_value(f"{label}.{key}", item, leaves[path])
         elif any(leaf[:len(path)] == path for leaf in leaves):
             _check_object_item(f"{label}.{key}", item, leaves, path)
         else:
