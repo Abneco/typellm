@@ -71,6 +71,8 @@ class ScoreTests(unittest.TestCase):
             {"type": "number", "levels": [level, {"label": ""}]},
             {"type": "number", "levels": [level, {"label": "High", "score": 2}]},  # unknown key
             {"type": "number", "levels": [level, {"label": "High"}], "enum": [0, 1]},
+            {"type": "number", "levels": [level, {"label": "High"}], "permutations": "auto"},  # the order is the scale
+            {"type": "number", "levels": [level, {"label": "High"}], "permutations": 1},
             {"type": "array", "items": {"type": "number", "levels": [level, {"label": "High"}]}},
             {"type": "array", "items": {"type": "object", "properties": {
                 "s": {"type": "number", "levels": [level, {"label": "High"}]}}}},

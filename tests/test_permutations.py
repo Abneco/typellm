@@ -112,6 +112,13 @@ class PermutationTests(unittest.TestCase):
         self.assertEqual(value_orders(['a', 'b', 'c', 'd', 'e', 'f']), value_orders(['d', 'f', 'a', 'c', 'e', 'b']))
         self.assertEqual(len(value_orders(['a', 'b', 'c', 'd', 'e', 'f'])), 6)
 
+    def test_sampled_orders_do_not_depend_on_the_enum_order(self):
+        def value_orders(values):
+            d = Choice('q', dict(zip('ABCDEF', values)), permutations=4)
+            return sorted(tuple(variant.choices.values()) for variant, _ in _choice_orderings(d, random.Random(0)))
+        self.assertEqual(value_orders(['a', 'b', 'c', 'd', 'e', 'f']), value_orders(['d', 'f', 'a', 'c', 'e', 'b']))
+        self.assertEqual(len(value_orders(['a', 'b', 'c', 'd', 'e', 'f'])), 4)
+
     def test_auto_cancels_a_pure_position_bias(self):
         client = TypeLLMClient("http://127.0.0.1:30000")
         client.sglang = DependencyFake()
