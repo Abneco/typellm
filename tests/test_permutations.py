@@ -55,7 +55,6 @@ class PermutationTests(unittest.TestCase):
 
     def test_validation_before_tokenizer_or_inference(self):
         invalid = [
-            {'type': 'boolean', 'permutations': 1},
             {'type': 'string', 'permutations': 2},
             {'type': 'number', 'permutations': 2},
         ] + [{'type': 'string', 'enum': ['a', 'b'], 'permutations': v}
@@ -126,14 +125,17 @@ class PermutationTests(unittest.TestCase):
         for probability in result['x']['probabilities'].values():
             self.assertAlmostEqual(probability, 1 / 4)
 
-    def test_one_matches_default(self):
-        outputs = []
-        for setting in ({}, {'permutations': 1}):
-            client = TypeLLMClient("http://127.0.0.1:30000")
-            client.sglang = DependencyFake([66])
-            outputs.append(client.generate(context='x', questions={'x': {
-                'type': 'string', 'enum': ['a', 'b'], 'return_probabilities': True, **setting}}).result)
-        self.assertEqual(*outputs)
+    def test_probabilities_average_over_orders_unless_told_not_to(self):
+        def permutations(**field):
+            [decision] = compile_json_schema({'type': 'object', 'properties': {'x': field}})
+            return decision.permutations
+        choice = {'type': 'string', 'enum': ['a', 'b']}
+        self.assertEqual(permutations(**choice, return_probabilities=True), 'auto')
+        self.assertEqual(permutations(type='boolean', return_probabilities=True), 'auto')
+        # A boolean's choices are true and false: it takes permutations without an enum.
+        self.assertEqual(permutations(type='boolean', return_probabilities=True, permutations=1), 1)
+        self.assertEqual(permutations(**choice, return_probabilities=True, permutations=1), 1)
+        self.assertEqual(permutations(**choice), 1)  # no probabilities asked: the order as written
 
 
 if __name__ == '__main__':

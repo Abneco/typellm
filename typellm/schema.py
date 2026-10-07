@@ -556,7 +556,8 @@ def _scalar(name: str, label: str, field: Mapping[str, Any]) -> Decision:
     enum = field.get("enum")
     permutations = field.get("permutations", 1)
     if "permutations" in field:
-        if enum is None:
+        # A boolean's choices are true and false, enum or not.
+        if enum is None and field_type != "boolean":
             raise SchemaError(f"permutations for {label!r} requires an explicit enum")
         if not (permutations in ("auto", "all") or type(permutations) is int and permutations > 0):
             raise SchemaError(f"permutations for {label!r} must be 'auto', 'all' or a positive integer")
@@ -570,6 +571,10 @@ def _scalar(name: str, label: str, field: Mapping[str, Any]) -> Decision:
         raise SchemaError(f"return_probabilities for {label!r} must be a boolean")
     if "return_probabilities" in field and field_type != "boolean" and enum is None:
         raise SchemaError(f"return_probabilities for {label!r} is only supported for enum or boolean fields")
+    # Probabilities are averaged over choice orders unless the field says otherwise: read in one
+    # order, they lean to the choices listed first. permutations: 1 keeps the order as written.
+    if return_probabilities and "permutations" not in field:
+        permutations = "auto"
     if "x-score" in field:
         raise SchemaError(
             f"x-score for {label!r} is not supported; use a number enum"
