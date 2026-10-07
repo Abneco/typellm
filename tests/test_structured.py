@@ -339,47 +339,6 @@ class ArrayTests(unittest.TestCase):
         self.assertIn('- "type" (one of ["C", "CV", "M"]): C, CV (void) or M (manual).\n'
                       '- "card" (one of ["VISA", null])', whole_prompts(sent)[0])
 
-    def test_a_choice_in_an_item_returns_probabilities(self):
-        array = {"type": "array", "items": {"type": "object", "properties": {
-            "number": {"type": "string"},
-            "type": {"type": "string", "enum": ["C", "CV", "M"], "return_probabilities": True},
-            "paid": {"type": "boolean", "return_probabilities": True},
-            "card": {"type": "string", "enum": ["VISA", "AMEX"]}}}}
-        # The fake picks the second choice when writing the item and the second label when scoring.
-        done, _, server = run({"checks": array}, ScriptServer([True], choose=lambda prompt, ids: ids[1]))
-        [item] = done.result["checks"]
-        self.assertEqual(item["type"]["value"], "CV")
-        self.assertAlmostEqual(item["type"]["probabilities"]["CV"], 1, places=3)
-        self.assertEqual(set(item["type"]["probabilities"]), {"C", "CV", "M"})
-        self.assertEqual(item["paid"]["value"], False)
-        self.assertEqual(item["card"], "AMEX")  # no probabilities asked: the bare value
-        # One scoring request for the two choices that ask: each asked as a field, after the item's other
-        # properties, and answered under "label".
-        scoring = [p for p in server.requests("score") if not any(
-            CONTINUE_MARK in t for t in ([p["text"]] if isinstance(p["text"], str) else p["text"]))]
-        self.assertEqual(len(scoring), 1)
-        type_prompt, paid_prompt = scoring[0]["text"]
-        self.assertIn('is this object, without one property:\n{"number": "blue", "paid": false, "card": "AMEX"}\n'
-                      'Choose that property.\nField: "type"\nType: choice\n', type_prompt)
-        self.assertIn('Choices (label: value): {"A": "C", "B": "CV", "C": "M"}', type_prompt)
-        self.assertTrue(type_prompt.endswith('{"label": "'))
-        self.assertIn('{"number": "blue", "type": "CV", "card": "AMEX"}', paid_prompt)
-
-    def test_an_item_with_probabilities_carries_over_and_the_state_shows_values(self):
-        array = {"type": "array", "items": {"type": "object", "properties": {
-            "number": {"type": "string"},
-            "type": {"type": "string", "enum": ["C", "CV", "M"], "return_probabilities": True}}}}
-        first, _, _ = run({"checks": array}, ScriptServer([True]))
-        given = first.result["checks"]
-        self.assertEqual(set(given[0]["type"]), {"value", "probabilities"})
-        # The result goes back as it came: accepted, returned unchanged, and shown plain in the state.
-        done, sent, _ = run({"checks": {**array, "continue_from": given}},
-                            ScriptServer([True], texts=lambda prompt: "second"))
-        self.assertEqual(done.result["checks"][0], given[0])
-        self.assertEqual(done.result["checks"][1]["number"], "second")
-        self.assertIn(STATE_MARK + '[{"number":"blue","type":"C"}]', whole_prompts(sent)[0])
-        self.assertNotIn("probabilities", whole_prompts(sent)[0].split(STATE_MARK)[1])
-
     def test_scalar_items_still_refuse_probabilities(self):
         with self.assertRaises(SchemaError):
             compile_json_schema({"type": "object", "properties": {"a": {"type": "array", "items": {
@@ -388,7 +347,7 @@ class ArrayTests(unittest.TestCase):
     def test_an_items_properties_do_not_think_or_depend(self):
         for key, value in (("thinking", True), ("thinking", "auto"), ("thinking_effort", "low"),
                            ("thinking_budget", 256), ("depends_on", ["company"]), ("when", {"company": "x"}),
-                           ("permutations", "auto")):
+                           ("permutations", "auto"), ("return_probabilities", True)):
             for where in ("title", "nested"):
                 with self.subTest(key=key, where=where), self.assertRaises(SchemaError):
                     title = {"type": "string", "enum": ["a", "b"], key: value}
