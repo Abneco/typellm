@@ -20,6 +20,17 @@ def is_number_pattern(pattern):
     return pattern.startswith((" ?-?", " ?(?:-?"))
 
 
+def default_value(schema):
+    """What the fake answers for a property of an object written whole: "blue", 7, true or the first choice."""
+    schema = next((option for option in schema["anyOf"] if option.get("type") != "null"), schema) \
+        if "anyOf" in schema else schema
+    if "enum" in schema:
+        return schema["enum"][0]
+    if schema["type"] == "object":
+        return {name: default_value(sub) for name, sub in schema["properties"].items()}
+    return {"string": "blue", "integer": 7, "number": 7, "boolean": True}[schema["type"]]
+
+
 class FakeServer(SGLangClient):
     """A real SGLangClient whose HTTP layer answers like SGLang.
 
@@ -42,7 +53,7 @@ class FakeServer(SGLangClient):
         texts = [payload["text"]] if isinstance(payload["text"], str) else payload["text"]
         params = payload["sampling_params"]
         params = params if isinstance(params, list) else [params] * len(texts)
-        if "token_ids_logprob" in payload:
+        if "token_ids_logprob" in payload and not any("json_schema" in p for p in params):
             rows = payload["token_ids_logprob"]
             rows = [rows] if isinstance(rows[0], int) else rows
             out = []
@@ -62,8 +73,9 @@ class FakeServer(SGLangClient):
             out = []
             for p in params:
                 schema = json.loads(p["json_schema"])
-                # An object schema answers {"key": "blue"}; a plain string schema "blue".
-                value = {next(iter(schema["properties"])): "blue"} if schema["type"] == "object" else "blue"
+                # An object schema answers each property as the fake does a field; a plain string schema "blue".
+                value = ({name: default_value(sub) for name, sub in schema["properties"].items()}
+                         if schema.get("type") == "object" else "blue")
                 out.append({"text": json.dumps(value), "meta_info": {"finish_reason": {"type": "stop"}}})
         else:
             out = [{"meta_info": {"prompt_tokens": 900}} for _ in texts]

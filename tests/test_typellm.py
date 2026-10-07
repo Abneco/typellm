@@ -626,7 +626,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         self.assertEqual(compiled.choices["A"], 0.0)
         self.assertEqual(compiled.choices["K"], 1.0)
         self.assertIn(
-            'Answer as {"score": "<label>"}.',
+            'Answer as {"label": "<label>"}.',
             compiled.opening_text(),
         )
         result = client.generate(context="context", schema=schema).result
@@ -655,7 +655,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
         self.assertEqual(result, {"scale": 0.5, "enabled": True})
         self.assertNotIn("A", result)
         # The dependent field continues from the parent's closed answer.
-        self.assertIn('<assistant>{"scale": "B"}</assistant>', fake.batch_prompts[1][0])
+        self.assertIn('<assistant>{"label": "B"}</assistant>', fake.batch_prompts[1][0])
 
     def test_open_integer_is_generated_under_its_pattern(self):
         schema = {
@@ -855,7 +855,7 @@ class JsonSchemaExecutionTests(unittest.TestCase):
 
         self.assertEqual(result, {"count": 7, "enabled": True})
         self.assertIn('<assistant>{"count": 7}</assistant>', client._last_prompts.get()[0])
-        self.assertIn('<assistant>{"enabled": "A"}</assistant>', client._last_prompts.get()[1])
+        self.assertIn('<assistant>{"label": "A"}</assistant>', client._last_prompts.get()[1])
 
     def test_batch_prefills_once_and_forks_independent_questions(self):
         schema = {

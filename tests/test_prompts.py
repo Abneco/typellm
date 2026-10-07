@@ -30,9 +30,9 @@ class UnifiedPromptTests(unittest.TestCase):
                      'Answer as {"total": <number or null>}. Do not use exponent notation. '
                      'Return null only if there is no value.',
             "paid": 'Field: "paid"\nType: boolean\nInstructions: Paid in cash?\n'
-                    'Choices: {"A": true, "B": false}\nAnswer as {"paid": "<label>"}.',
+                    'Choices (label: value): {"A": true, "B": false}\nAnswer as {"label": "<label>"}.',
             "card": 'Field: "card"\nType: choice\nInstructions: Card.\n'
-                    'Choices: {"A": "VISA", "B": null}\nAnswer as {"card": "<label>"}.',
+                    'Choices (label: value): {"A": "VISA", "B": null}\nAnswer as {"label": "<label>"}.',
         })
 
 if __name__ == "__main__":

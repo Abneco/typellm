@@ -272,6 +272,10 @@ def _question(label: str, field: Mapping[str, Any], default: str) -> str:
     return instructions if instructions is not None else description if description is not None else default
 
 
+# Keys an array item's properties do not take: the item is written whole, in one request.
+_NOT_IN_ITEMS = ("thinking", "thinking_effort", "thinking_budget", "depends_on", "when", "permutations")
+
+
 def _object_entries(path: tuple[str, ...], field: Mapping[str, Any], label: str, *, inside_array: bool,
                     around: dict[str, tuple[str, Any]], outer: tuple = ()) -> list[_Entry]:
     """The scalar properties of an object, nested objects' included, as entries named by path.
@@ -300,6 +304,11 @@ def _object_entries(path: tuple[str, ...], field: Mapping[str, Any], label: str,
         member_label = f"{label}.{name}"
         if not isinstance(member, Mapping):
             raise SchemaError(f"property {member_label!r} must be a schema object")
+        if inside_array:
+            for key in _NOT_IN_ITEMS:
+                if key in member:
+                    raise SchemaError(f"{key} is not supported inside array items (on {member_label!r}): "
+                                      "each item is written as one JSON object")
         kind = _kind(member_label, member)
         member_path = path + (name,)
         if kind == "array":
@@ -313,8 +322,6 @@ def _object_entries(path: tuple[str, ...], field: Mapping[str, Any], label: str,
             scope[name] = ("object", tuple(entry.decision.name for entry in members))
             continue
         decision = _scalar(".".join(member_path), member_label, member)
-        if inside_array and decision.return_probabilities:
-            raise SchemaError(f"return_probabilities is not supported inside arrays (on {member_label!r})")
         entries.append(_Entry(replace(decision, path=member_path, shown_name=name, scope=header),
                               member, scope, outer=outer))
         scope[name] = ("scalar", decision.name)
@@ -407,7 +414,11 @@ def _check_object_item(label: str, value: Any, leaves: Mapping[tuple[str, ...], 
     for key, item in value.items():
         path = at + (key,)
         if path in leaves:
-            _check_value(f"{label}.{key}", item, leaves[path])
+            decision = leaves[path]
+            # An item as a call returned it: a choice that returns probabilities is {"value", "probabilities"}.
+            if decision.return_probabilities and isinstance(item, Mapping) and set(item) == {"value", "probabilities"}:
+                item = item["value"]
+            _check_value(f"{label}.{key}", item, decision)
         elif any(leaf[:len(path)] == path for leaf in leaves):
             _check_object_item(f"{label}.{key}", item, leaves, path)
         else:

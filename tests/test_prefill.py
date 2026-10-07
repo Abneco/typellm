@@ -27,10 +27,11 @@ class PrefillTests(unittest.TestCase):
         prompts = [t for p in grammar for t in p["text"]]
         self.assertTrue(any(t.endswith('{"total":') for t in prompts))
         self.assertTrue(any(t.endswith('{"item":') for t in prompts))
-        # Choices are scored at {"paid": " — the next token is the label.
-        labels = [t for p in client.sglang.requests("score") for t in
-                  ([p["text"]] if isinstance(p["text"], str) else p["text"]) if t.endswith('{"paid": "')]
-        self.assertEqual(len(labels), 1)
+        # Choices are scored at {"label": " — the next token is the label; not at {"paid": ".
+        scored = [t for p in client.sglang.requests("score") for t in
+                  ([p["text"]] if isinstance(p["text"], str) else p["text"])]
+        self.assertEqual(len(scored), 1)
+        self.assertTrue(scored[0].endswith('Answer as {"label": "<label>"}.<|im_end|>\n<|im_start|>assistant\n{"label": "'))
 
     def test_history_holds_the_closed_object(self):
         client, _ = self.run_generate(self.QUESTIONS)
