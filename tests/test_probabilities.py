@@ -16,8 +16,9 @@ class FieldProbabilityTests(unittest.TestCase):
                 fake = FakeSGLang([ord('B'), ord('A'), ord('B')])
                 with patch('typellm.runtime.SGLangClient', return_value=fake):
                     result = run_schema(context='receipt', questions={
-                        'choice': {'type': field_type, 'enum': candidates, 'return_probabilities': True},
-                        'flag': {'type': 'boolean', 'return_probabilities': True},
+                        'choice': {'type': field_type, 'enum': candidates, 'return_probabilities': True,
+                                   'permutations': 1},
+                        'flag': {'type': 'boolean', 'return_probabilities': True, 'permutations': 1},
                         'plain': {'type': 'boolean', 'return_probabilities': False},
                     }).result
                 self.assertEqual(result['choice']['value'], candidates[1])

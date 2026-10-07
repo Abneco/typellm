@@ -37,7 +37,7 @@ class DependencyTests(unittest.TestCase):
             'left': {'type': 'boolean', 'depends_on': ['root']},
             'unrelated': {'type': 'boolean'},
             'right': {'type': 'boolean', 'depends_on': ['root']},
-            'root': {'type': 'boolean', 'return_probabilities': True},
+            'root': {'type': 'boolean', 'return_probabilities': True, 'permutations': 1},
         }
         result = client.generate(context='shared', questions=questions).result
         self.assertEqual(list(result), list(questions))
@@ -92,7 +92,7 @@ class DependencyTests(unittest.TestCase):
         client = self.client([ord('X'), ord('A')])
         result = client.generate(context='', questions={
             'pick': {'type': 'integer', 'enum': list(range(24)),
-                     'return_probabilities': True},
+                     'return_probabilities': True, 'permutations': 1},
             'check': {'type': 'boolean', 'depends_on': ['pick']},
         }).result
         self.assertEqual(result['pick']['value'], 23)

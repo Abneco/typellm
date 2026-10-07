@@ -77,7 +77,7 @@ class RuntimeTests(unittest.TestCase):
         client = TypeLLMClient("http://127.0.0.1:30000", model="fake")
         client.sglang = FakeSGLang(selected_ids=[ord("C")])
         result = client.generate(context="Receipt", questions={
-            "paid": {"type": ["boolean", "null"], "return_probabilities": True},
+            "paid": {"type": ["boolean", "null"], "return_probabilities": True, "permutations": 1},
         }).result
         self.assertIsNone(result["paid"]["value"])
         self.assertEqual(set(result["paid"]["probabilities"]), {True, False, None})

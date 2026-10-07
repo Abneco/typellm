@@ -44,7 +44,7 @@ TypeLLM brings type-safe generation to existing autoregressive LLMs without chan
 5. **Made for open autoregressive LLMs** — Use compatible models you already serve with SGLang.
 6. **Supports thinking mode** — Enable reasoning before the final constrained answer.
 7. **Image input** — Pass images to vision-language models alongside the text context. See [Image input](#image-input).
-8. **Permutation averaging** — Reduce option-order bias on explicit enum questions with balanced, sampled or exhaustive orderings. See the [docs](https://typellm.ai/docs/probabilities#permutation-averaging).
+8. **Permutation averaging** — Reduce option-order bias on enum and boolean probabilities with balanced, sampled or exhaustive orderings, by default. See the [docs](https://typellm.ai/docs/probabilities#permutation-averaging).
 
 ### JevBench results
 
@@ -535,7 +535,7 @@ response = run_schema(
 
 ### Per-question permutation averaging
 
-Add `permutations` to an `enum` question to reduce option-order bias. TypeLLM averages the probabilities and keeps the same return format.
+A field that returns probabilities averages them over option orders, to reduce option-order bias; `permutations` sets how. The return format stays the same.
 
 ```python
 response = client.generate(
@@ -544,21 +544,22 @@ response = client.generate(
         "type": "string",
         "enum": ["one", "two", "three", "four", "five", "six"],
         "instructions": "What number will come up on this roll?",
-        "permutations": "auto",
-        "return_probabilities": True,
+        "return_probabilities": True,  # averaged with permutations: "auto"
     }},
 )
 ```
 
-- `"auto"` evaluates a balanced set of orderings: each option takes every position,
+- `"auto"`, the default with `return_probabilities`, evaluates a balanced set of
+  orderings: each option takes every position,
   and follows every other option, equally often. That is `K` orderings for `K`
   options (`2K` when `K` is odd), and the result does not depend on the order the
   enum was written in.
 - `"all"` evaluates every ordering (up to 720).
 - An integer greater than 1 samples that many distinct orderings at random.
 
-Omit it or use `1` to keep the original behavior. Only explicit `enum` fields
-support this option.
+Use `1` to read the options once, in the order written; that is also how a
+field without `return_probabilities` answers. Enum and boolean fields take this
+option.
 
 [Docs](https://typellm.ai/docs/probabilities#permutation-averaging) · [Read the blog](https://typellm.ai/blog/fair-die)
 
