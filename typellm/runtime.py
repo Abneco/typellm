@@ -25,6 +25,7 @@ from .schema import (
     CONTINUE_QUESTION,
     MAX_ARRAY_ITEMS,
     MAX_ENUM_CHOICES,
+    OBJECT_ITEM_SCOPE,
     THINKING_EFFORTS,
     ArrayField,
     SchemaError,
@@ -122,10 +123,11 @@ class Choice:
 
     @property
     def label_prefill(self) -> str:
-        """Start of a choice answer, {"name": "; the next token is the label."""
-        if self.field_name is None or self.text_type or self.numeric_type is not None:
+        """Start of a choice answer, {"label": "; the next token is the label. Not '{"type": "', after which
+        a model writes the field's value, "C", which may be another choice's label."""
+        if self.text_type or self.numeric_type is not None:
             return ""
-        return "{" + json.dumps(self.field_name, ensure_ascii=False) + ': "'
+        return '{"label": "'
 
     def opening_text(self) -> str:
         """The field's prompt: the same Field / Type / Instructions / Answer lines for every type,
@@ -154,9 +156,10 @@ class Choice:
             if self.nullable:
                 answer += " Return null only if there is no value."
         else:
-            lines.append(f"Choices: {json.dumps(dict(self.choices), ensure_ascii=False)}")
-            answer = (f'Answer as {{{json.dumps(name, ensure_ascii=False)}: "<label>"}}.'
-                      if name is not None else "Answer with the best label only.")
+            # Say which side is the label, and answer under "label", not the field's name: after
+            # '{"type": "' a model writes the field's value, such as "C", which may be another choice's label.
+            lines.append(f"Choices (label: value): {json.dumps(dict(self.choices), ensure_ascii=False)}")
+            answer = 'Answer as {"label": "<label>"}.'
         lines.append(answer)
         return "\n".join(lines)
 
@@ -1010,6 +1013,136 @@ def _describe_item(decision: Choice) -> str:
     return "one of " + json.dumps(list(decision.choices.values()), ensure_ascii=False)
 
 
+def _whole_items(array: ArrayChoice) -> bool:
+    """Whether an array writes each item as one JSON object under its grammar: every object array.
+
+    Its properties then follow one another in a single request, each seeing the ones before it, so
+    they all describe the same item.
+    """
+    return array.item_object
+
+
+def _item_schema(decision: Choice) -> dict[str, Any]:
+    """A property's grammar. A choice, enum or boolean, is written as its value: a model writing an item
+    writes what it read, and a label could be taken for a value of the same name."""
+    if decision.text_type:
+        schema: dict[str, Any] = {"type": "string"}
+    elif decision.numeric_type is not None:
+        schema = {"type": decision.numeric_type}
+    elif decision.syntax == "Bool":
+        schema = {"type": "boolean"}
+    else:
+        return {"enum": list(decision.choices.values())}  # null is a choice when the enum lists it
+    return {"anyOf": [schema, {"type": "null"}]} if decision.nullable else schema
+
+
+def _item_line(decision: Choice) -> str:
+    """A property's line in a whole item's prompt: its path, its type or values, and its instructions."""
+    name = json.dumps(".".join(_path(decision)), ensure_ascii=False)
+    # A property's own instructions; the generated default says nothing here, as in the specification.
+    said = "" if decision.question.startswith("Choose the value for ") else f": {decision.question}"
+    return f"- {name} ({_describe_item(decision)}){said}"
+
+
+def _item_probabilities(client, state: str, item: Mapping[str, Any], decisions: Sequence[Choice],
+                        image_count: int) -> dict[tuple[str, ...], dict[Any, float]]:
+    """Each choice's probabilities in an item written whole, for the choices that ask for them.
+
+    Each is asked as a field outside an array is, labels and all, after the item's other properties,
+    so the probabilities hold for this item. One request scores them all.
+    """
+    asked = [decision for decision in decisions if decision.choices and decision.return_probabilities]
+    if not asked:
+        return {}
+    shared = [{"role": "user", "content": _user_content(state.rstrip(), image_count)}]
+    prefixes, ids = [], []
+    for decision in asked:
+        others = json.loads(json.dumps(item))
+        *parents, leaf = _path(decision)
+        node = others
+        for parent in parents:
+            node = node[parent]
+        del node[leaf]
+        question = ("The next item of the array above is this object, without one property:\n"
+                    + json.dumps(others, ensure_ascii=False) + "\nChoose that property.\n"
+                    + replace(decision, scope="").opening_text())
+        prefixes.append(client.render_chat(shared + [{"role": "user", "content": question}],
+                                           add_generation_prompt=True) + decision.label_prefill)
+        ids.append([client.single_token(label)[0] for label in decision.choices])
+    scored, _ = client.score_candidates_batch(prefixes, ids)
+    out = {}
+    for decision, label_ids, (scores, _meta) in zip(asked, ids, scored):
+        logprobs = {label: scores.get(token_id, float("-inf")) for label, token_id in zip(decision.choices, label_ids)}
+        if all(value == float("-inf") for value in logprobs.values()):
+            raise SGLangError(f"no scores for the labels of {'.'.join(_path(decision))!r}")
+        out[_path(decision)] = {decision.choices[label]: p for label, p in candidate_softmax(logprobs).items()}
+    return out
+
+
+def _plain(item: Any, decisions: Sequence[Choice]) -> Any:
+    """An object item with each {"value": ..., "probabilities": ...} of its choices replaced by the value."""
+    if not isinstance(item, Mapping):
+        return item
+    out = json.loads(json.dumps(item))
+    for decision in decisions:
+        if not getattr(decision, "return_probabilities", False):
+            continue
+        *parents, leaf = _path(decision)
+        node = out
+        for parent in parents:
+            node = node.get(parent) if isinstance(node, Mapping) else None
+        if isinstance(node, dict) and isinstance(node.get(leaf), Mapping) and "value" in node[leaf]:
+            node[leaf] = node[leaf]["value"]
+    return out
+
+
+def _object_grammar(decisions: Sequence[Choice]) -> dict[str, Any]:
+    """The JSON Schema of an object item: its properties by path, nested objects included, in order."""
+    tree: dict[str, Any] = {}
+    for decision in decisions:
+        *parents, leaf = _path(decision)
+        node = tree
+        for parent in parents:
+            node = node.setdefault(parent, {})
+        node[leaf] = decision
+
+    def schema(node: Mapping[str, Any]) -> dict[str, Any]:
+        return {"type": "object", "additionalProperties": False, "required": list(node),
+                "properties": {name: _item_schema(child) if isinstance(child, Choice) else schema(child)
+                               for name, child in node.items()}}
+    return schema(tree)
+
+
+def _generate_whole_item(client, state: str, array: ArrayChoice, temperature: float, rng: random.Random,
+                         numeric_max_digits: int, image_count: int) -> tuple[dict[str, Any], str]:
+    """An object array's next item in one request: the whole object, its keys in schema order."""
+    lines = [OBJECT_ITEM_SCOPE.split(" Answer one of its properties.")[0],
+             "Answer with the whole object as JSON, with these properties in this order:"]
+    lines += [_item_line(decision) for decision in array.items]
+    schema = _object_grammar(array.items)
+    names = schema["required"]
+    messages = [{"role": "user", "content": _user_content(state.rstrip(), image_count)},
+                {"role": "user", "content": "\n".join(lines)}]
+    prompt = client.render_chat(messages, add_generation_prompt=True)
+    # Room for every value at its own limit, and for the keys and punctuation around them.
+    budget = sum(getattr(client, "text_max_tokens", 128) if decision.text_type
+                 else numeric_max_digits + 4 if decision.numeric_type is not None else 16
+                 for decision in array.items) + 8 * len(array.items) + 8
+    seed = rng.randrange(2**31) if temperature else 0
+    value = client.generate_json(prompt, schema, budget, temperature=temperature or 0, seed=seed)
+    if not isinstance(value, Mapping) or list(value) != names:
+        raise SGLangError(f"array {array.name!r}: an item did not match its schema")
+    item = dict(value)
+    # A choice that asks for probabilities answers as a field does: {"value": ..., "probabilities": {...}}.
+    for path, probabilities in _item_probabilities(client, state, value, array.items, image_count).items():
+        *parents, leaf = path
+        node = item
+        for parent in parents:
+            node = node[parent]
+        node[leaf] = {"value": node[leaf], "probabilities": probabilities}
+    return item, prompt
+
+
 def _array_specification(array: ArrayChoice, dependency_values: Mapping[str, Any]) -> str:
     """What an array is to hold: the part of its state that never changes between turns."""
     lines = [f"Array: {json.dumps(array.name, ensure_ascii=False)}", f"Instructions: {array.question}"]
@@ -1066,13 +1199,17 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
     them; MAX_ARRAY_ITEMS counts the items this call adds.
     """
     specification = _array_specification(array, dependency_values)
-    items: list[Any] = list(array.continue_from)
+    # What the caller gets back, and the plain items the state shows: a choice that returns
+    # probabilities is {"value": ..., "probabilities": ...} in the one and its value in the other.
+    returned: list[Any] = list(array.continue_from)
+    items: list[Any] = [_plain(item, array.items) for item in returned]
     committed: set[str] = {_canonical_json(item) for item in items}
     prompts: list[str] = []
     thinking: dict[str, str] = {}
     efforts: dict[str, str] = {}
     skipped: list[str] = []
     retries = 0 if mode == "argmax" else DUPLICATE_RETRIES
+    whole = _whole_items(array) and callable(getattr(client, "generate_json", None))
     limit = len(items) + MAX_ARRAY_ITEMS if array.max_items is None else array.max_items
     while len(items) < limit:
         state = _array_state(context, specification, items)
@@ -1084,22 +1221,29 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
             prompts += turn
             if kind is None:
                 break
-        decisions = list(array.open_items if may_end and array.open_items is not None else array.items)
-        run_item = (_execute_dependency_decisions if any(d.depends_on is not None for d in decisions)
-                    else _execute_batch_decisions)
-        # The continue question's prompt starts with the state, so once it is asked the state is cached.
-        rows, turn = run_item(client, state, decisions, mode, temperature, rng, numeric_max_digits,
-                              image_count=image_count, prefix_cached=asked)
-        prompts += [prompt for prompt in turn if prompt is not None]
         item_prefix = f"{array.name}[{len(items)}]"
-        output, item_thinking, item_efforts, item_skipped = _assemble(decisions, rows, item_prefix)
-        item = output if array.item_object else output.get("item")
+        if whole:
+            item, prompt = _generate_whole_item(client, state, array, temperature, rng, numeric_max_digits,
+                                                image_count)
+            prompts.append(prompt)
+            item_thinking, item_efforts, item_skipped = {}, {}, []
+        else:
+            decisions = list(array.open_items if may_end and array.open_items is not None else array.items)
+            run_item = (_execute_dependency_decisions if any(d.depends_on is not None for d in decisions)
+                        else _execute_batch_decisions)
+            # The continue question's prompt starts with the state, so once it is asked the state is cached.
+            rows, turn = run_item(client, state, decisions, mode, temperature, rng, numeric_max_digits,
+                                  image_count=image_count, prefix_cached=asked)
+            prompts += [prompt for prompt in turn if prompt is not None]
+            output, item_thinking, item_efforts, item_skipped = _assemble(decisions, rows, item_prefix)
+            item = output if array.item_object else output.get("item")
         if not array.item_object:
             if may_end and array.open_items is not None and item is None:
                 break  # null: the array is complete
             # A scalar item is named by its index alone, "skills[0]".
             item_thinking = {item_prefix: text for text in item_thinking.values()}
             item_efforts = {item_prefix: effort for effort in item_efforts.values()}
+        shown, item = item, _plain(item, array.items) if array.item_object else item
         key = _canonical_json(item)
         if key in committed:
             LOG.info("array=%s duplicate item %s", array.name, key)
@@ -1109,10 +1253,11 @@ def _generate_array(client, context, array, dependency_values, mode, temperature
             continue
         committed.add(key)
         items.append(item)
+        returned.append(shown)
         thinking.update(item_thinking)
         efforts.update(item_efforts)
         skipped += item_skipped
-    return {"name": array.name, "question": array.question, "label": None, "value": items,
+    return {"name": array.name, "question": array.question, "label": None, "value": returned,
             "probabilities": None, "thinking": thinking, "thinking_effort": efforts, "skipped": skipped,
             "prompts": prompts}
 

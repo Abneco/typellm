@@ -994,6 +994,21 @@ class SGLangClient:
         params = self._text_params(nullable, after_key, temperature, seed)
         return self._read_texts(self._batch(prefixes, params, "text"), nullable, after_key)
 
+    def generate_json(self, prefix: str, schema: Mapping[str, Any], max_new_tokens: int, *,
+                      temperature: float = 0, seed: int = 0) -> Any:
+        """One JSON value under a JSON Schema grammar: the keys are forced and the values follow in order."""
+        [item] = self._batch([prefix], [{"max_new_tokens": max_new_tokens, "temperature": temperature,
+                                         "sampling_seed": seed, "json_schema": json.dumps(schema)}], "json")
+        meta = item.get("meta_info", {}) if isinstance(item, Mapping) else {}
+        finish = meta.get("finish_reason", {}) if isinstance(meta, Mapping) else {}
+        kind = finish.get("type") if isinstance(finish, Mapping) else finish
+        if kind != "stop" or not isinstance(item.get("text"), str):
+            raise SGLangError(f"JSON generation did not complete normally: {finish!r}")
+        try:
+            return json.loads(item["text"])
+        except ValueError as exc:
+            raise SGLangError("JSON generation returned invalid JSON") from exc
+
     def generate_fields(
         self,
         number_prefixes: Sequence[str],

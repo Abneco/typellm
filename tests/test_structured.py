@@ -39,7 +39,9 @@ class ScriptServer(FakeServer):
             return response
         texts = [payload["text"]] if isinstance(payload["text"], str) else payload["text"]
         out = response if isinstance(response, list) else [response]
-        if "token_ids_logprob" in payload:
+        params = payload["sampling_params"]
+        params = params if isinstance(params, list) else [params] * len(texts)
+        if "token_ids_logprob" in payload and not any("json_schema" in p for p in params):
             rows = payload["token_ids_logprob"]
             rows = [rows] if isinstance(rows[0], int) else rows
             for text, ids, item in zip(texts, rows, out):
@@ -58,6 +60,9 @@ class ScriptServer(FakeServer):
             params = payload["sampling_params"]
             params = params if isinstance(params, list) else [params] * len(texts)
             for text, p, item in zip(texts, params, out):
+                if "json_schema" in p and json.loads(p["json_schema"]).get("type") == "object":
+                    item["text"] = json.dumps(self.whole_item(text, json.loads(p["json_schema"])))
+                    continue
                 if "regex" not in p:
                     continue
                 if is_number_pattern(p["regex"]) and self.numbers:
@@ -65,6 +70,26 @@ class ScriptServer(FakeServer):
                 elif not is_number_pattern(p["regex"]) and self.texts:
                     item["text"] = " " + json.dumps(self.texts(text)) + "}"
         return response
+
+
+    def whole_item(self, prompt, schema):
+        """An object item written whole: each property answered by the callable its type would use, asked as
+        if the prompt named that property."""
+        item = {}
+        for name, sub in schema["properties"].items():
+            sub = next((o for o in sub["anyOf"] if o.get("type") != "null"), sub) if "anyOf" in sub else sub
+            asked = f'{prompt}\nField: "{name}"'
+            if sub.get("type") == "object":
+                item[name] = self.whole_item(prompt, sub)
+            elif sub.get("type") == "string" and "enum" not in sub:
+                item[name] = self.texts(asked) if self.texts else "blue"
+            elif sub.get("type") in ("integer", "number"):
+                item[name] = self.numbers(asked) if self.numbers else 7
+            else:
+                options = sub["enum"] if "enum" in sub else [True, False]
+                pick = self.choose(asked, list(range(len(options)))) if self.choose else None
+                item[name] = options[pick if pick is not None else 0]
+        return item
 
 
 def run(questions, server=None, **options):
@@ -198,6 +223,18 @@ def skills_server(count, **options):
     return ScriptServer([True] * count, texts=texts, **options)
 
 
+def grammars_sent(server):
+    """The JSON Schemas of the requests that wrote a whole object."""
+    firsts = [p["sampling_params"][0] if isinstance(p["sampling_params"], list) else p["sampling_params"]
+              for p in server.payloads]
+    return [json.loads(first["json_schema"]) for first in firsts if "json_schema" in first]
+
+
+def whole_prompts(sent):
+    """Prompts that ask for an object item written whole."""
+    return [t for t in sent if "Answer with the whole object as JSON" in t]
+
+
 def item_prompts(sent):
     return [t for t in sent if 'Field: "item"' in t]
 
@@ -247,6 +284,7 @@ class ArrayTests(unittest.TestCase):
 
     def test_an_array_of_objects(self):
         jobs = [("Google", "Engineer", 2020, False), ("Stripe", "Senior Engineer", 2023, True)]
+        jobs_json = [{"company": "Google", "title": "Engineer", "start_year": 2020, "current": False}]
 
         def texts(prompt):
             return jobs[len(current(prompt))][["company", "title"].index(field(prompt))]
@@ -260,13 +298,115 @@ class ArrayTests(unittest.TestCase):
             {"company": "Google", "title": "Engineer", "start_year": 2020, "current": False},
             {"company": "Stripe", "title": "Senior Engineer", "start_year": 2023, "current": True},
         ]})
-        # An item's properties fork from the same state in one batch, none seeing another's value.
-        first = [t for t in sent if "Field: " in t and CONTINUE_MARK not in t and current(t) == []]
-        self.assertEqual(sorted(field(t) for t in first), ["company", "current", "start_year", "title"])
-        self.assertFalse(any("Dependency results" in t for t in first))
+        # Each item is one object written whole, its properties in schema order, after the continue question.
+        whole = whole_prompts(sent)
+        self.assertEqual([current(t) for t in whole], [[], [jobs_json[0]]])
+        self.assertIn('- "company" (string): Company name.\n- "title" (string): Job title.\n'
+                      '- "start_year" (integer): Starting year.\n- "current" (boolean): Whether', whole[0])
+        self.assertFalse(any('Field: "' in t and CONTINUE_MARK not in t for t in sent))
         # The committed object, in its canonical form, is the state of the next turn.
         self.assertTrue(any(STATE_MARK + '[{"company":"Google","title":"Engineer","start_year":2020,'
                             '"current":false}]' in t for t in sent))
+
+    def test_an_object_item_is_one_grammar_request(self):
+        done, sent, server = run({"work_experience": WORK}, skills_server(2))
+        self.assertEqual(len(done.result["work_experience"]), 2)
+        grammars = grammars_sent(server)
+        self.assertEqual(len(grammars), 2)  # one request an item; the continue questions are scored
+        self.assertEqual(grammars[0], {"type": "object", "additionalProperties": False,
+                                       "required": ["company", "title", "start_year", "current"],
+                                       "properties": {"company": {"type": "string"}, "title": {"type": "string"},
+                                                      "start_year": {"type": "integer"},
+                                                      "current": {"type": "boolean"}}})
+
+    def test_a_whole_items_schema_keeps_null_and_choices(self):
+        array = {"type": "array", "items": {"type": "object", "properties": {
+            "tip": {"type": ["number", "null"]}, "card": {"type": ["string", "null"], "enum": ["VISA", None]}}}}
+        _, _, server = run({"a": array}, ScriptServer([True]))
+        [grammar] = grammars_sent(server)
+        self.assertEqual(grammar["properties"], {"tip": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                                                 "card": {"enum": ["VISA", None]}})
+
+    def test_a_choice_in_an_item_is_written_as_its_value(self):
+        # Values, not labels: a model writing an item writes what it read, and a label "C" could be read
+        # as the value "C".
+        array = {"type": "array", "items": {"type": "object", "properties": {
+            "type": {"type": "string", "enum": ["C", "CV", "M"], "instructions": "C, CV (void) or M (manual)."},
+            "card": {"type": ["string", "null"], "enum": ["VISA", None]}}}}
+        done, sent, server = run({"checks": array}, ScriptServer([True], choose=lambda prompt, ids: ids[1]))
+        self.assertEqual(done.result, {"checks": [{"type": "CV", "card": None}]})
+        self.assertEqual(grammars_sent(server)[0]["properties"]["type"], {"enum": ["C", "CV", "M"]})
+        self.assertIn('- "type" (one of ["C", "CV", "M"]): C, CV (void) or M (manual).\n'
+                      '- "card" (one of ["VISA", null])', whole_prompts(sent)[0])
+
+    def test_a_choice_in_an_item_returns_probabilities(self):
+        array = {"type": "array", "items": {"type": "object", "properties": {
+            "number": {"type": "string"},
+            "type": {"type": "string", "enum": ["C", "CV", "M"], "return_probabilities": True},
+            "paid": {"type": "boolean", "return_probabilities": True},
+            "card": {"type": "string", "enum": ["VISA", "AMEX"]}}}}
+        # The fake picks the second choice when writing the item and the second label when scoring.
+        done, _, server = run({"checks": array}, ScriptServer([True], choose=lambda prompt, ids: ids[1]))
+        [item] = done.result["checks"]
+        self.assertEqual(item["type"]["value"], "CV")
+        self.assertAlmostEqual(item["type"]["probabilities"]["CV"], 1, places=3)
+        self.assertEqual(set(item["type"]["probabilities"]), {"C", "CV", "M"})
+        self.assertEqual(item["paid"]["value"], False)
+        self.assertEqual(item["card"], "AMEX")  # no probabilities asked: the bare value
+        # One scoring request for the two choices that ask: each asked as a field, after the item's other
+        # properties, and answered under "label".
+        scoring = [p for p in server.requests("score") if not any(
+            CONTINUE_MARK in t for t in ([p["text"]] if isinstance(p["text"], str) else p["text"]))]
+        self.assertEqual(len(scoring), 1)
+        type_prompt, paid_prompt = scoring[0]["text"]
+        self.assertIn('is this object, without one property:\n{"number": "blue", "paid": false, "card": "AMEX"}\n'
+                      'Choose that property.\nField: "type"\nType: choice\n', type_prompt)
+        self.assertIn('Choices (label: value): {"A": "C", "B": "CV", "C": "M"}', type_prompt)
+        self.assertTrue(type_prompt.endswith('{"label": "'))
+        self.assertIn('{"number": "blue", "type": "CV", "card": "AMEX"}', paid_prompt)
+
+    def test_an_item_with_probabilities_carries_over_and_the_state_shows_values(self):
+        array = {"type": "array", "items": {"type": "object", "properties": {
+            "number": {"type": "string"},
+            "type": {"type": "string", "enum": ["C", "CV", "M"], "return_probabilities": True}}}}
+        first, _, _ = run({"checks": array}, ScriptServer([True]))
+        given = first.result["checks"]
+        self.assertEqual(set(given[0]["type"]), {"value", "probabilities"})
+        # The result goes back as it came: accepted, returned unchanged, and shown plain in the state.
+        done, sent, _ = run({"checks": {**array, "continue_from": given}},
+                            ScriptServer([True], texts=lambda prompt: "second"))
+        self.assertEqual(done.result["checks"][0], given[0])
+        self.assertEqual(done.result["checks"][1]["number"], "second")
+        self.assertIn(STATE_MARK + '[{"number":"blue","type":"C"}]', whole_prompts(sent)[0])
+        self.assertNotIn("probabilities", whole_prompts(sent)[0].split(STATE_MARK)[1])
+
+    def test_scalar_items_still_refuse_probabilities(self):
+        with self.assertRaises(SchemaError):
+            compile_json_schema({"type": "object", "properties": {"a": {"type": "array", "items": {
+                "type": "string", "enum": ["x", "y"], "return_probabilities": True}}}})
+
+    def test_an_items_properties_do_not_think_or_depend(self):
+        for key, value in (("thinking", True), ("thinking", "auto"), ("thinking_effort", "low"),
+                           ("thinking_budget", 256), ("depends_on", ["company"]), ("when", {"company": "x"}),
+                           ("permutations", "auto")):
+            for where in ("title", "nested"):
+                with self.subTest(key=key, where=where), self.assertRaises(SchemaError):
+                    title = {"type": "string", "enum": ["a", "b"], key: value}
+                    props = ({"company": {"type": "string"}, "title": title} if where == "title" else
+                             {"company": {"type": "string"}, "role": {"type": "object", "properties": {"title": title}}})
+                    compile_json_schema({"type": "object", "properties": {"w": {
+                        "type": "array", "items": {"type": "object", "properties": props}}}})
+
+    def test_a_nested_object_in_an_item_is_written_with_it(self):
+        array = {"type": "array", "items": {"type": "object", "properties": {
+            "company": {"type": "string"},
+            "place": {"type": "object", "properties": {"city": {"type": "string"}, "remote": {"type": "boolean"}}}}}}
+        done, sent, server = run({"jobs": array}, ScriptServer([True]))
+        self.assertEqual(done.result, {"jobs": [{"company": "blue", "place": {"city": "blue", "remote": True}}]})
+        [grammar] = grammars_sent(server)
+        self.assertEqual(grammar["required"], ["company", "place"])
+        self.assertEqual(grammar["properties"]["place"]["required"], ["city", "remote"])
+        self.assertIn('- "place.city" (string)', whole_prompts(sent)[0])
 
     def test_min_items_are_generated_before_null_is_allowed(self):
         done, sent, _ = run({"skills": {**SKILLS, "minItems": 2}}, skills_server(0))
@@ -332,7 +472,7 @@ class ArrayTests(unittest.TestCase):
             self.assertLessEqual(text.count(CONTINUE_MARK), 1)
             if any(f'Field: "{name}"' in text for name in WORK["items"]["properties"]):
                 self.assertNotIn(CONTINUE_MARK, text)
-        self.assertIn('Answer as {"append_item": "<label>"}.', server.continue_prompts[0])
+        self.assertTrue(server.continue_prompts[0].endswith('Answer as {"label": "<label>"}.<|im_end|>\n<|im_start|>assistant\n{"label": "'))
 
     def test_a_state_is_warmed_only_when_no_continue_question_cached_it(self):
         # A continue question, or a string item, is alone in its batch and caches its prompt itself; the
@@ -342,10 +482,9 @@ class ArrayTests(unittest.TestCase):
         self.assertEqual(server.requests("count"), [])
         _, _, server = run({"work_experience": WORK}, skills_server(2))
         self.assertEqual(server.requests("count"), [])
+        # Below minItems an object item is one request too, and caches its own prompt.
         _, _, server = run({"work_experience": {**WORK, "minItems": 1}}, skills_server(1))
-        warm = server.requests("count")
-        self.assertEqual(len(warm), 1)
-        self.assertIn(STATE_MARK + "[]", warm[0]["text"])
+        self.assertEqual(server.requests("count"), [])
 
     def test_committed_json_is_canonical(self):
         self.assertEqual(_canonical_json([{"b": 1, "a": True, "c": None, "d": 2.5, "e": "café"}]),
