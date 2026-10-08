@@ -16,6 +16,7 @@
 
 ## Updates
 - 🚀 **[TypeLLM API](https://typellm.ai)** is live: typed outputs without serving a model, $5 free credit. [Try it](https://typellm.ai/dashboard/playground) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
+- **[2026/10/08]** [Conditional fields](#conditional-fields) can test how sure an answer is: `"when": {"category": {"confidence": {"gte": 0.8}}}`.
 - **[2026/10/05]** Added [objects and arrays](#objects-and-arrays): group typed properties into one value, or return a variable number of typed items.
 - **[2026/10/01]** Added [conditional fields](#conditional-fields): a field with `when` is answered only if its dependencies meet conditions.
 - **[2026/10/01]** Added [thinking effort](#thinking-effort): set thinking by level, or let `"thinking": "auto"` choose it on each call.
@@ -473,6 +474,7 @@ their answers:
 "when": {"amount": {"gte": 1000}}                      # gt, gte, lt and lte compare numbers
 "when": {"score": {"gt": 0, "lte": 60}}                # several tests: all must pass
 "when": {"tip": {"ne": None}}                          # not null
+"when": {"category": {"confidence": {"gte": 0.8}}}     # how sure the answer is
 ```
 
 With several fields, every test must pass. Values are checked against the
@@ -480,6 +482,18 @@ field's type: an enum value, `True` or `False`, a number, or `None` for a
 nullable field. `gt`, `gte`, `lt` and `lte` work on number fields only, and a
 `None` answer fails them. Text fields cannot be tested, except for `None`.
 These tests run in code on the typed answers, so they add no requests.
+
+`confidence` tests how sure a field's answer is rather than the answer itself:
+it takes `gt`, `gte`, `lt` and `lte` with bounds from 0 to 1, on a field with
+`return_probabilities`, and can sit beside a test of the answer. Act on a sure
+answer and send an unsure one to a person, in the same call:
+
+```python
+"auto_refund": {"type": "boolean",
+                "when": {"category": {"in": ["billing"], "confidence": {"gte": 0.8}}}},
+"needs_review": {"type": "boolean",
+                 "when": {"category": {"confidence": {"lt": 0.8}}}},
+```
 
 A skipped field is not run and has no key in `result`, even if a JSON Schema
 `required` lists it; `response.skipped` lists it. Fields that depend on a

@@ -986,6 +986,13 @@ def _execute_dependency_decisions(
     prompts_by_name = {}
     ancestors = {}
     hidden = {d.name for d in decisions if d.effort_for is not None}
+    by_name = {d.name: d for d in decisions}
+
+    def confidence(name: str) -> float | None:
+        """A dependency's confidence, for a "when" that tests it; None without probabilities."""
+        row = rows_by_name[name]
+        return _confidence(by_name[name], row["probabilities"]) if row.get("probabilities") else None
+
     for layer in dependency_layers(decisions):
         dependency_values = {}
         parent_prefixes = {}
@@ -999,7 +1006,9 @@ def _execute_dependency_decisions(
                       else tuple((name,) for name in decision.depends_on or ()))
             if any(all(rows_by_name[name] is None for name in group) for group in groups) or (
                     decision.when is not None and not condition_met(
-                        decision, {name: rows_by_name[name]["value"] for name, _ in decision.when})):
+                        decision, {name: rows_by_name[name]["value"] for name, _ in decision.when},
+                        {name: confidence(name) for name, tests in decision.when
+                         if any(operator == "confidence" for operator, _ in tests)})):
                 rows_by_name[decision.name] = prompts_by_name[decision.name] = None
                 continue
             visible = set(decision.depends_on or ())
