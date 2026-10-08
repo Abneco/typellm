@@ -721,10 +721,11 @@ def _choices(label: str, field: Mapping[str, Any]) -> tuple[list[Any], tuple[tup
     return values, tuple(descriptions)
 
 
-# "when" operators. A bare value means {"in": [value]}, and a list {"in": list}.
+# "when" operators. A bare value means {"in": [value]}, and a list {"in": list}. "confidence"
+# compares the dependency's confidence, not its answer: {"confidence": {"gte": 0.8}}.
 COMPARISONS = {"gt": lambda a, b: a > b, "gte": lambda a, b: a >= b,
                "lt": lambda a, b: a < b, "lte": lambda a, b: a <= b}
-OPERATORS = ("in", "not_in", "ne", *COMPARISONS)
+OPERATORS = ("in", "not_in", "ne", *COMPARISONS, "confidence")
 
 
 def _numeric(decision: Decision) -> bool:
@@ -754,7 +755,8 @@ def _condition(name: str, field: Mapping[str, Any], by_name: Mapping[str, Decisi
     The fields it names become dependencies if depends_on leaves them out. Equality tests (a value, a list,
     in, not_in, ne) take answers the field can give: an enum value, true or false, a
     number, or null for a nullable field. gt, gte, lt and lte take numbers, on number
-    fields. Open text fields cannot be conditions, except for null.
+    fields. Open text fields cannot be conditions, except for null. confidence maps gt, gte, lt
+    and lte to bounds from 0 to 1, on a field that returns probabilities.
     """
     when = field["when"]
     if not isinstance(when, Mapping) or not when:
@@ -773,6 +775,9 @@ def _condition(name: str, field: Mapping[str, Any], by_name: Mapping[str, Decisi
             if operator not in OPERATORS:
                 raise SchemaError(f"when for {name!r}: unknown operator {operator!r} on {parent!r}; "
                                   f"use one of {list(OPERATORS)}")
+            if operator == "confidence":
+                tests.append((operator, _confidence_bounds(name, parent, source, operand)))
+                continue
             if operator in COMPARISONS:
                 if not _numeric(source):
                     raise SchemaError(f"when for {name!r}: {operator} needs a number field, and {parent!r} is not")
@@ -791,6 +796,23 @@ def _condition(name: str, field: Mapping[str, Any], by_name: Mapping[str, Decisi
     return tuple(condition)
 
 
+def _confidence_bounds(name: str, parent: str, source: Any, bounds: Any) -> tuple[tuple[str, float], ...]:
+    """A "confidence" test's bounds, as ((operator, bound), ...): only on a field with probabilities."""
+    if not getattr(source, "return_probabilities", False):
+        raise SchemaError(f"when for {name!r}: confidence on {parent!r} needs return_probabilities on {parent!r}")
+    if not isinstance(bounds, Mapping) or not bounds:
+        raise SchemaError(f"when for {name!r}: confidence on {parent!r} must map gt, gte, lt or lte to a number")
+    tests = []
+    for operator, bound in bounds.items():
+        if operator not in COMPARISONS:
+            raise SchemaError(f"when for {name!r}: confidence on {parent!r} takes {list(COMPARISONS)}, "
+                              f"not {operator!r}")
+        if not _is_finite_number(bound) or not 0 <= bound <= 1:
+            raise SchemaError(f"when for {name!r}: confidence {operator} on {parent!r} must be a number from 0 to 1")
+        tests.append((operator, bound))
+    return tuple(tests)
+
+
 def _passes(operator: str, operand: Any, answer: Any) -> bool:
     if operator == "in":
         return any(_same_value(answer, value) for value in operand)
@@ -802,10 +824,16 @@ def _passes(operator: str, operand: Any, answer: Any) -> bool:
     return _is_finite_number(answer) and COMPARISONS[operator](answer, operand)
 
 
-def condition_met(decision: Any, answers: Mapping[str, Any]) -> bool:
-    """Whether a decision with a "when" runs, given its dependencies' answers."""
-    return all(_passes(operator, operand, answers[parent])
-               for parent, tests in decision.when for operator, operand in tests)
+def condition_met(decision: Any, answers: Mapping[str, Any],
+                  confidences: Mapping[str, float | None] | None = None) -> bool:
+    """Whether a decision with a "when" runs, given its dependencies' answers and, for "confidence"
+    tests, their confidences."""
+    def holds(parent: str, operator: str, operand: Any) -> bool:
+        if operator == "confidence":
+            confidence = (confidences or {}).get(parent)
+            return confidence is not None and all(COMPARISONS[op](confidence, bound) for op, bound in operand)
+        return _passes(operator, operand, answers[parent])
+    return all(holds(parent, operator, operand) for parent, tests in decision.when for operator, operand in tests)
 
 
 def _thinking_settings(name: str, field: Mapping[str, Any]) -> tuple[bool | str | None, int | None]:

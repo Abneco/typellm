@@ -170,6 +170,39 @@ class ConditionalFieldTests(unittest.TestCase):
                     "x": {"type": "boolean", "depends_on": ["n"], "when": when}})
                 self.assertEqual("x" in done.result, runs)
 
+    def test_confidence_conditions(self):
+        # Read in one order, the fake is sure of its first option; averaged over orders it is not.
+        sure = {"type": "string", "enum": ["bug", "incident"], "return_probabilities": True, "permutations": 1}
+        unsure = {"type": "string", "enum": ["bug", "incident"], "return_probabilities": True}
+        for category, when, runs in (
+            (sure, {"category": {"confidence": {"gte": 0.8}}}, True),
+            (unsure, {"category": {"confidence": {"gte": 0.8}}}, False),
+            (unsure, {"category": {"confidence": {"lt": 0.5}}}, True),
+            (sure, {"category": {"in": ["bug"], "confidence": {"gte": 0.8}}}, True),
+            (sure, {"category": {"in": ["incident"], "confidence": {"gte": 0.8}}}, False),
+            (sure, {"category": {"confidence": {"gt": 0.5, "lte": 1}}}, True),
+        ):
+            with self.subTest(category=category is sure, when=when):
+                done, sent = self.run_questions({"category": category, "auto_route": {
+                    "type": "boolean", "when": when}})
+                self.assertEqual("auto_route" in done.result, runs)
+                self.assertEqual(done.skipped, [] if runs else ["auto_route"])
+                self.assertEqual(self.asked(sent, "auto_route"), runs)
+
+    def test_a_confidence_condition_needs_probabilities_and_bounds(self):
+        probabilities = {"type": "string", "enum": ["bug", "incident"], "return_probabilities": True}
+        for category, test in (
+            ({"type": "string", "enum": ["bug", "incident"]}, {"confidence": {"gte": 0.8}}),
+            (probabilities, {"confidence": {"gte": 1.5}}),
+            (probabilities, {"confidence": {"gte": -0.1}}),
+            (probabilities, {"confidence": {"in": [0.8]}}),
+            (probabilities, {"confidence": 0.8}),
+            (probabilities, {"confidence": {}}),
+            (probabilities, {"confidence": {"gte": True}}),
+        ):
+            with self.subTest(category=category, test=test), self.assertRaises(SchemaError):
+                self.run_questions({"category": category, "x": {"type": "boolean", "when": {"category": test}}})
+
 
 if __name__ == "__main__":
     unittest.main()
