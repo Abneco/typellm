@@ -595,6 +595,13 @@ class JsonSchemaExecutionTests(unittest.TestCase):
                 choices={str(index): index for index in range(27)},
             )
 
+    def test_manual_choice_needs_two_values(self):
+        from typellm import Choice
+
+        for kwargs in ({"choices": {"A": "only"}}, {"choices": {"A": 0}, "levels": ("Only",)}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "at least 2"):
+                Choice(question="Only one?", **kwargs)
+
     def test_eleven_value_number_enum_uses_a_through_k(self):
         schema = {
             "type": "object",
