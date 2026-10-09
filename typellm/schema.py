@@ -656,6 +656,9 @@ def _scalar(name: str, label: str, field: Mapping[str, Any]) -> Decision:
             f"enum for {label!r} has {len(values)} values; "
             f"the maximum is {MAX_ENUM_CHOICES}"
         )
+    # One value leaves nothing to choose.
+    if len(values) < 2:
+        raise SchemaError(f"enum for {label!r} needs at least 2 values")
     if _has_duplicates(values):
         raise SchemaError(f"enum for {label!r} contains duplicate values")
     return Decision(name, question, tuple(values), syntax, return_probabilities=return_probabilities,

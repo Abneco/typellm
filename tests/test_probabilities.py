@@ -46,7 +46,7 @@ class FieldProbabilityTests(unittest.TestCase):
 
     def test_default_is_plain(self):
         decisions = compile_json_schema({'type': 'object', 'properties': {
-            'choice': {'type': 'string', 'enum': ['a']},
+            'choice': {'type': 'string', 'enum': ['a', 'b']},
             'flag': {'type': 'boolean'},
         }})
         self.assertTrue(all(not d.return_probabilities for d in decisions))

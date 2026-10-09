@@ -90,6 +90,16 @@ class ConfidenceTests(unittest.TestCase):
         self.assertEqual(answer["value"], "billing")
         self.assertAlmostEqual(answer["confidence"], (0.95 - 1 / 4) / (1 - 1 / 4))
 
+    def test_a_choice_needs_two_options(self):
+        for field in (
+            {"type": "string", "enum": ["only"], "return_probabilities": True},
+            {"type": "string", "choices": [{"value": "only"}]},
+        ):
+            with self.subTest(field=field), self.assertRaises(SchemaError):
+                compile_json_schema({"type": "object", "properties": {"x": field}})
+        # A value or null is two options.
+        compile_json_schema({"type": "object", "properties": {"x": {"type": ["string", "null"], "enum": ["only", None]}}})
+
     def test_a_booleans_confidence_is_its_distance_from_even(self):
         flag = {"type": "boolean", "return_probabilities": True, "permutations": 1}
         answer = scored({"flag": flag}, {A: 0.8, B: 0.2})["flag"]

@@ -301,7 +301,7 @@ class JsonSchemaCompilerTests(unittest.TestCase):
                 "type": "object",
                 "properties": {
                     "second": {"type": "boolean"},
-                    "first": {"type": "string", "enum": ["x"]},
+                    "first": {"type": "string", "enum": ["x", "y"]},
                 },
             }
         )
