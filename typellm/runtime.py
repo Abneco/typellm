@@ -105,6 +105,9 @@ class Choice:
                 f"Choice has {len(self.choices)} values; "
                 f"the maximum is {MAX_ENUM_CHOICES}"
             )
+        # One value or one level leaves nothing to choose, and no confidence to compute.
+        if len(self.choices) == 1 or len(self.levels) == 1:
+            raise ValueError("Choice needs at least 2 values")
         if any(not label for label in self.choices):
             raise ValueError("Choice labels must be non-empty strings")
 

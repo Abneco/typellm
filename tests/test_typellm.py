@@ -286,13 +286,13 @@ class JsonSchemaCompilerTests(unittest.TestCase):
         schema = {
             "type": "object",
             "properties": {
-                "value": {"type": "integer", "enum": list(range(24))}
+                "value": {"type": "integer", "enum": list(range(26))}
             },
         }
         [decision] = compile_json_schema(schema)
-        self.assertEqual(len(decision.choices), 24)
-        schema["properties"]["value"]["enum"].append(24)
-        with self.assertRaisesRegex(SchemaError, "maximum is 24"):
+        self.assertEqual(len(decision.choices), 26)
+        schema["properties"]["value"]["enum"].append(26)
+        with self.assertRaisesRegex(SchemaError, "maximum is 26"):
             compile_json_schema(schema)
 
     def test_property_order_is_decision_order(self):
@@ -301,7 +301,7 @@ class JsonSchemaCompilerTests(unittest.TestCase):
                 "type": "object",
                 "properties": {
                     "second": {"type": "boolean"},
-                    "first": {"type": "string", "enum": ["x"]},
+                    "first": {"type": "string", "enum": ["x", "y"]},
                 },
             }
         )
@@ -586,14 +586,21 @@ class JsonSchemaExecutionTests(unittest.TestCase):
                 tokenizer.encode = lambda text, encoded=encoded: encoded
                 self.assertEqual(client.render_chat([], add_generation_prompt=True), expected)
 
-    def test_manual_choice_is_limited_to_twenty_four_values(self):
+    def test_manual_choice_is_limited_to_twenty_six_values(self):
         from typellm import Choice
 
-        with self.assertRaisesRegex(ValueError, "maximum is 24"):
+        with self.assertRaisesRegex(ValueError, "maximum is 26"):
             Choice(
                 question="Too many?",
-                choices={str(index): index for index in range(25)},
+                choices={str(index): index for index in range(27)},
             )
+
+    def test_manual_choice_needs_two_values(self):
+        from typellm import Choice
+
+        for kwargs in ({"choices": {"A": "only"}}, {"choices": {"A": 0}, "levels": ("Only",)}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "at least 2"):
+                Choice(question="Only one?", **kwargs)
 
     def test_eleven_value_number_enum_uses_a_through_k(self):
         schema = {

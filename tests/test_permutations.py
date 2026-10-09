@@ -72,7 +72,7 @@ class PermutationTests(unittest.TestCase):
         client.sglang = DependencyFake([65] * 3)
         result = client.generate(context='x', questions={
             'x': {'type': 'boolean', 'enum': [False, True], 'permutations': 100},
-            'y': {'type': 'string', 'enum': ['a'], 'permutations': 'all'},
+            'y': {'type': 'string', 'enum': ['a', 'b']},
         }).result
         self.assertIsInstance(result['x'], bool)
         self.assertEqual(result['y'], 'a')
