@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 
-MAX_ENUM_CHOICES = 24
+MAX_ENUM_CHOICES = 26
 MAX_PERMUTATIONS = 720
 
 

@@ -171,7 +171,7 @@ TypeLLM supports finite decisions, numeric fields, and free text:
 | Object | `{"type": "object", "properties": {...}}` | `dict` |
 | Array | `{"type": "array", "items": {...}}` | `list` |
 
-Enum choices support `string`, `integer`, and `number` types, with 2 to 24 values. The declared `type` validates the candidate values.
+Enum choices support `string`, `integer`, and `number` types, with 2 to 26 values. The declared `type` validates the candidate values.
 
 To say what each choice means, write `choices` in place of `enum`:
 
