@@ -16,6 +16,7 @@
 
 ## Updates
 - 🚀 **[TypeLLM API](https://typellm.ai)** is live: typed outputs without serving a model, $5 free credit. [Try it](https://typellm.ai/dashboard/playground) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
+- **[2026/10/14]** Added [tools and human input](#tools-and-human-input): a workflow pauses for answers from your own tools or a person, and resumes with them.
 - **[2026/10/08]** [Conditional fields](#conditional-fields) can test how sure an answer is: `"when": {"category": {"confidence": {"gte": 0.8}}}`.
 - **[2026/10/05]** Added [objects and arrays](#objects-and-arrays): group typed properties into one value, or return a variable number of typed items.
 - **[2026/10/01]** Added [conditional fields](#conditional-fields): a field with `when` is answered only if its dependencies meet conditions.
@@ -102,6 +103,23 @@ client = TypeLLMClient(
     model="Qwen/Qwen3.8-27B",
 )
 ```
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `base_url` | `"http://127.0.0.1:30000"` | SGLang server URL. |
+| `model` | `None` | Model ID; discovered from the server when omitted. |
+| `tokenizer` | `None` | Matching tokenizer ID or local path; when omitted, the server's paths, then its served model name. |
+| `text_max_tokens` | `128` | Text generation budget per field. |
+| `numeric_max_digits` | `32` | Digit limit for open numeric fields. |
+| `temperature` | `0` | 0 gives each field its most likely answer; above 0 samples at that temperature. |
+| `seed` | `None` | Client random-number seed. |
+| `timeout` | `120.0` | HTTP request timeout in seconds. |
+
+On your own server, no service limits apply: your server's context length,
+memory and timeouts are the only bounds. An enum takes up to 26 values, and a
+field that thinks without a `thinking_budget` may reason until the context is
+full. `label_pool` customizes the internal candidate labels; leave it unset for
+normal use. For debugging, `print_final_prompt=True` prints the prompts sent.
 
 ### Make a request
 
@@ -500,6 +518,40 @@ A skipped field is not run and has no key in `result`, even if a JSON Schema
 skipped field are skipped too, even when their other dependencies ran. A skipped
 field sends no requests; only its definition counts toward the call's input
 tokens.
+
+### Tools and human input
+
+Some answers come from outside the model: an order's status from your database,
+a result from your own tool, or a person's decision. On the hosted API, a field
+with `"source": "user"` is answered by your code. The call answers every field
+that does not wait on it, then stops with `status` `"needs_input"`, and
+`client.resume()` goes on with your answers:
+
+```python
+response = client.generate(context=email, questions={
+    "order_id": {"type": ["string", "null"], "instructions": "The order number in the email."},
+    "order_status": {"type": "string", "enum": ["shipped", "delivered", "lost"],
+                     "source": "user", "when": {"order_id": {"ne": None}}},
+    "reply": {"type": "string", "depends_on": ["order_status"]},
+})
+while response.status == "needs_input":   # response.needs_input names the fields
+    response = client.resume(response, {"order_status": lookup(response.result["order_id"])})
+```
+
+On your own server, pass answers you already have in `given`, as `result` gives
+them, and fields to leave out in `skipped`. The model is not asked those fields,
+and the fields that depend on them see them as answers:
+
+```python
+response = client.generate(context=email, questions=questions,
+                           given={"order_status": "lost"}, skipped=["refund"])
+```
+
+Passing a call's `result` and `skipped` back, with more fields, answers only the
+new ones. A field with `return_probabilities` is given as `result` has it, with
+its probabilities.
+
+[Docs](https://typellm.ai/docs/workflows#tools-and-human-input) · [Cookbook](https://typellm.ai/cookbook/tools-and-human-input)
 
 ## Probabilities and sampling
 
