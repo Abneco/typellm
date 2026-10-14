@@ -258,6 +258,15 @@ class Generation:
     usage: Usage
     thinking_effort: dict[str, str] = field(default_factory=dict)
     skipped: list[str] = field(default_factory=list)
+    # Hosted only: "needs_input" when the call stopped for answers to the fields in needs_input;
+    # resume() continues it from resume_state.
+    status: str = "completed"
+    needs_input: dict[str, Any] = field(default_factory=dict)
+    resume_state: str | None = None
+    # The questions the call was asked, to read probabilities in the response to resume().
+    _questions: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
+    # Each answered field's turn, verbatim: generate(_turns=) rebuilds given fields' prompts from them.
+    _turns: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
 
 
 class TypeLLMClient:
@@ -578,11 +587,22 @@ class TypeLLMClient:
         timeout: float | None = None,
         cancel: threading.Event | None = None,
         print_final_prompt: bool = False,
+        given: Mapping[str, Any] | None = None,
+        skipped: Sequence[str] | None = None,
+        _turns: Mapping[str, str] | None = None,
     ) -> Generation:
         """Answer every field; fields run in parallel unless they declare depends_on.
 
         Returns the typed answers in .result, with .thinking and .usage. When a
         local call fails, the exception's .usage holds the tokens it spent.
+
+        given holds answers you already have, as .result gives them: the model
+        is not asked those fields, and the fields that depend on them see them
+        as the model's answers. A field with return_probabilities is given with
+        its probabilities. skipped names fields to leave out, as .skipped names
+        them; the fields that depend on them are left out too. Passing a
+        call's .result and .skipped back with more fields answers only the new
+        ones, and continues the prompts the server has cached.
 
         A seed fixes this call's own random choices and leaves the client's shared
         stream alone; without one, calls share that stream. The server's numerics
@@ -611,17 +631,30 @@ class TypeLLMClient:
             if temperature is None:
                 temperature = self.temperature or None
             active_mode, active_temperature = _resolve_decoding(mode, temperature)
+        if given is not None and not isinstance(given, Mapping):
+            raise SchemaError("given must be a mapping of field names to answers")
+        if skipped is not None and (isinstance(skipped, str) or not isinstance(skipped, Sequence)
+                                    or not all(isinstance(name, str) for name in skipped)):
+            raise SchemaError("skipped must be a list of field names")
         if self.api_key is not None:
-            if questions is None or cancel is not None or print_final_prompt:
-                raise ValueError("with api_key, generate() takes questions; schema, cancel and "
-                                 "print_final_prompt need your own server")
+            if questions is None or cancel is not None or print_final_prompt or given or skipped:
+                raise ValueError("with api_key, generate() takes questions; schema, cancel, given, "
+                                 "skipped and print_final_prompt need your own server")
             return self._generate_hosted(context, questions, encoded_images, active_mode,
                                          active_temperature, seed, timeout)
+        properties = schema.get("properties") if isinstance(schema, Mapping) else None
+        asked = [name for name, field in (properties.items() if isinstance(properties, Mapping) else ())
+                 if isinstance(field, Mapping) and field.get("source") == "user" and name not in (given or {})]
+        if asked:
+            raise SchemaError(f'{asked!r} have source "user": the hosted API asks the user for them; '
+                              "on your own server, pass their answers in given")
         rng = self.rng if seed is None else random.Random(seed)
         # The time budget covers compiling too: labels are tokenized by SGLang.
         with call_scope(timeout, cancel) as scope:
             try:
                 decisions = self.compile_schema(schema)
+                given_by_name = _given_by_name(decisions, given or {})
+                skip = _skip_names(decisions, skipped or ())
                 count = getattr(self.sglang, "count_tokens", None)
                 if callable(count):
                     scope.usage.input_tokens = sum(map(count, (
@@ -629,15 +662,18 @@ class TypeLLMClient:
                     scope.unmeasured_images = len(encoded_images)
                 # Independent fields run together; depends_on turns the fields into a
                 # graph whose layers run in order, and so do arrays, which take turns of their own.
-                run = (_execute_dependency_decisions
-                       if any(d.depends_on is not None or isinstance(d, ArrayChoice) for d in decisions)
-                       else _execute_batch_decisions)
+                # Given and skipped fields are settled as the graph is walked.
+                graph = given_by_name or skip or any(
+                    d.depends_on is not None or isinstance(d, ArrayChoice) for d in decisions)
+                run = _execute_dependency_decisions if graph else _execute_batch_decisions
+                settled = ({"given": given_by_name, "skip": skip, "turns": dict(_turns or {})}
+                           if given_by_name or skip else {})
                 attach = self.sglang.images(encoded_images) if encoded_images else nullcontext()
                 with attach:
                     rows, prompts = run(
                         self.sglang, context, decisions, active_mode,
                         active_temperature, rng, self.numeric_max_digits,
-                        image_count=len(encoded_images),
+                        image_count=len(encoded_images), **settled,
                     )
             except BaseException as exc:
                 exc.usage = scope.usage  # partial work, for callers that bill it
@@ -647,10 +683,12 @@ class TypeLLMClient:
                                 for text in (row["prompts"] if isinstance(decision, ArrayChoice) and row
                                              else [prompt]) if text is not None])
         output, thinking, effort, skipped = _assemble(decisions, rows)
+        turns = {decision.name: row["turn"] for decision, row in zip(decisions, rows)
+                 if row is not None and row.get("turn") and not isinstance(decision, ArrayChoice)}
 
         if print_final_prompt:
             _print_final_prompts(self._last_prompts.get())
-        return Generation(output, thinking, scope.usage, effort, skipped)
+        return Generation(output, thinking, scope.usage, effort, skipped, _turns=turns)
 
     def _generate_hosted(self, context: str, questions: Mapping[str, Any], images: Sequence[str],
                          mode: str, temperature: float, seed: int | None,
@@ -679,6 +717,37 @@ class TypeLLMClient:
             body["timeout"] = active_timeout  # the service's own default (60 s) otherwise
         # The service times the call itself. The margin covers its queue, image
         # scaling and the grace it gives its own workers past the timeout.
+        return self._hosted_generation(body, active_timeout, questions)
+
+    def resume(self, generation: Generation | str, answers: Mapping[str, Any], *,
+               timeout: float | None = None) -> Generation:
+        """Continue a hosted call that stopped for input (status "needs_input").
+
+        generation is that call's Generation, or its resume_state; answers maps
+        each field in its needs_input to the value to use. The result holds
+        every field answered so far. It may stop for input again.
+        """
+        if self.api_key is None:
+            raise ValueError("resume() needs the hosted API: fields answered by the user are hosted only")
+        state = generation.resume_state if isinstance(generation, Generation) else generation
+        if not isinstance(state, str) or not state:
+            raise ValueError("resume() needs a call that stopped for input, or its resume_state")
+        if not isinstance(answers, Mapping):
+            raise ValueError("answers must be a mapping of field names to values")
+        active_timeout = self.timeout if timeout is None else timeout
+        if active_timeout is not None and (type(active_timeout) not in (int, float) or
+                                           not active_timeout > 0):
+            raise ValueError("timeout must be a positive number of seconds or None")
+        body: dict[str, Any] = {"resume_state": state, "answers": dict(answers)}
+        if active_timeout is not None:
+            body["timeout"] = active_timeout
+        questions = generation._questions if isinstance(generation, Generation) else None
+        return self._hosted_generation(body, active_timeout, questions)
+
+    def _hosted_generation(self, body: dict[str, Any], active_timeout: float | None,
+                           questions: Mapping[str, Any] | None) -> Generation:
+        # The service times the call itself. The margin covers its queue, image
+        # scaling and the grace it gives its own workers past the timeout.
         response = self._post_hosted(body, (active_timeout if active_timeout is not None
                                             else DEFAULT_SOCKET_TIMEOUT) + 60)
         if response.status_code != 200:
@@ -697,7 +766,7 @@ class TypeLLMClient:
             # JSON keys are strings: key probabilities by each field's values again, as locally.
             # The service writes booleans as JSON does and other values as str() does, so an
             # enum holding both "None" and null gets one entry.
-            for name, question in questions.items():
+            for name, question in (questions or {}).items():
                 answer = result.get(name)
                 if isinstance(answer, dict) and "probabilities" in answer:  # a return_probabilities answer
                     given = question.get("enum") or [choice.get("value") for choice in question.get("choices") or []]
@@ -705,11 +774,14 @@ class TypeLLMClient:
                               for value in given or (True, False, None)}
                     answer["probabilities"] = {values.get(key, key): probability
                                                for key, probability in answer["probabilities"].items()}
+            status = data.get("status") or "completed"
+            needs_input = data.get("needs_input") or {}
+            resume_state = data.get("resume_state")
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             raise SGLangError("TypeLLM API returned an invalid response",
                               status=response.status_code) from exc
         return Generation(result, thinking, Usage(input_tokens=input_tokens, thinking_tokens=thinking_tokens),
-                          effort, skipped)
+                          effort, skipped, status, needs_input, resume_state, questions)
 
     def _http(self) -> httpx.Client:
         with self._http_lock:
@@ -1051,15 +1123,162 @@ def _mean_order_probabilities(scored, orders, label_tokens, temperature):
     return {label: math.fsum(values) / len(scored) for label, values in aligned.items()}
 
 
+def _question_content(decision, values: Mapping[str, Any]) -> str:
+    """A field's question turn: its dependencies' answers, then its own prompt."""
+    content = decision.opening_text()
+    if values:
+        content = "Dependency results (JSON):\n" + json.dumps(values, ensure_ascii=False) + "\n\n" + content
+    return content
+
+
+_MISSING = object()
+
+
+def _given_value(given: Mapping[str, Any], path: Sequence[str]) -> Any:
+    """The value given at a path ("person", "age"), or _MISSING."""
+    value: Any = given
+    for key in path:
+        if not isinstance(value, Mapping) or key not in value:
+            return _MISSING
+        value = value[key]
+    return value
+
+
+def _skip_names(decisions: Sequence[Any], skipped: Sequence[str]) -> set[str]:
+    """The decisions skipped names, as Generation.skipped names them: a field, an object or a property."""
+    paths = [tuple(name.split(".")) for name in skipped]
+    names = {d.name for d in decisions if d.effort_for is None and any(
+        _path(d)[:len(path)] == path for path in paths)}
+    unknown = [name for name, path in zip(skipped, paths)
+               if not any(_path(d)[:len(path)] == path for d in decisions if d.effort_for is None)]
+    if unknown:
+        raise SchemaError(f"skipped names fields the schema does not have: {unknown!r}")
+    return names
+
+
+def _given_by_name(decisions: Sequence[Any], given: Mapping[str, Any]) -> dict[str, Any]:
+    """Each given decision's value, by decision name; a value is checked when its row is made."""
+    by_name = {}
+    for decision in decisions:
+        if decision.effort_for is not None:
+            continue
+        value = _given_value(given, _path(decision))
+        if value is not _MISSING:
+            by_name[decision.name] = value
+    tops = {_path(d)[0] for d in decisions if d.effort_for is None}
+    unknown = [name for name in given if name not in tops]
+    if unknown:
+        raise SchemaError(f"given names fields the schema does not have: {unknown!r}")
+    return by_name
+
+
+def _given_number_text(value: Any) -> str:
+    """A given number as the model writes one: 45, not 45.0."""
+    if type(value) is float and value.is_integer() and abs(value) < 2**53:
+        return str(int(value))
+    return json.dumps(value)
+
+
+def _given_probabilities(decision: Choice, given: Any, label: str) -> dict[str, float]:
+    """A given answer's probabilities by label, keyed by value as result gives them (or by the JSON
+    text of the value, as the hosted API's JSON does)."""
+    if not isinstance(given, Mapping) or not isinstance(given.get("probabilities"), Mapping):
+        raise SchemaError(f"given {label} must be given as result gives it, with its probabilities")
+    probabilities = {}
+    for choice, value in decision.choices.items():
+        keys = [key for key in given["probabilities"]
+                if (key == value and type(key) is type(value)) or key == json.dumps(value) or key == str(value)]
+        if not keys:
+            raise SchemaError(f"given {label} has no probability for {value!r}")
+        probabilities[choice] = float(given["probabilities"][keys[0]])
+    return probabilities
+
+
+def _given_row(client, context: str, decision: Any, given: Any, parent: str | None,
+               values: Mapping[str, Any], image_count: int, turn: str | None = None) -> tuple[dict, str | None]:
+    """A given field's row and prompt: the prompt the model would have answered, closed with the given
+    answer, so the fields that depend on it continue it as they would continue the model's answer.
+
+    With the field's turn from the call that answered it, the prompt is that call's, verbatim,
+    reasoning included; without, it is rebuilt as the model would answer without thinking."""
+    label = ".".join(_path(decision))
+    if isinstance(decision, ArrayChoice):
+        if not isinstance(given, list):
+            raise SchemaError(f"given {label} must be an array")
+        return {"name": decision.name, "question": decision.question, "label": None, "value": given,
+                "probabilities": None, "thinking": {}, "thinking_effort": {}, "skipped": [], "prompts": []}, None
+    probabilities = None
+    if decision.return_probabilities:
+        if not isinstance(given, Mapping) or "value" not in given:
+            raise SchemaError(f"given {label} must be given as result gives it, with its probabilities")
+        value = given["value"]
+    else:
+        value = given
+    chosen = None
+    if value is None and decision.nullable and (decision.text_type or decision.numeric_type is not None):
+        closed = _closed_answer(decision, "null")
+    elif decision.text_type:
+        if not isinstance(value, str):
+            raise SchemaError(f"given {label} must be a string")
+        closed = _closed_answer(decision, json.dumps(value, ensure_ascii=False))
+    elif decision.numeric_type is not None:
+        if (type(value) is not int and (decision.numeric_type == "integer" or type(value) is not float
+                                        or not math.isfinite(value))):
+            raise SchemaError(f"given {label} must be {'an integer' if decision.numeric_type == 'integer' else 'a number'}")
+        closed = _closed_answer(decision, _given_number_text(value))
+    else:
+        if decision.levels:
+            if not _is_number(value) or not 0 <= value <= len(decision.levels) - 1:
+                raise SchemaError(f"given {label} must be a score from 0 to {len(decision.levels) - 1}")
+            level = decision.levels[round(value)]
+            chosen = next(choice for choice, v in decision.choices.items() if v == level)
+        else:
+            chosen = next((choice for choice, v in decision.choices.items()
+                           if v == value and (type(v) is type(value) or (_is_number(v) and _is_number(value)))), None)
+            if chosen is None:
+                raise SchemaError(f"given {label} is not one of its choices")
+        if decision.return_probabilities:
+            probabilities = _given_probabilities(decision, given, label)
+            if decision.levels:  # the score's history names its most likely level, as the model's does
+                chosen = max(probabilities, key=probabilities.__getitem__)
+        closed = (_closed_value(decision, decision.choices[chosen]) if decision.by_value
+                  else _closed_label(decision, client.single_token(chosen)[1]))
+    shared = [{"role": "user", "content": _user_content(context.rstrip(), image_count)}]
+    base = parent if parent is not None else client.render_chat(shared, add_generation_prompt=False)
+    if turn is not None and closed in turn:  # a turn that answered otherwise is not this answer's
+        completed = base + turn
+    else:
+        content = _question_content(decision, values)
+        # Rebuilt, a given field did not think: its prompt is the one it has without thinking.
+        own = {"thinking": False} if decision.thinking or decision.effort_from is not None else {}
+        if parent is not None:
+            prompt = client.extend_chat_prefix(parent, content, finish_thinking=False, **own)
+        else:
+            messages = shared + [{"role": "user", "content": content}]
+            prompt = client.render_chat(messages, add_generation_prompt=True, finish_thinking=False, **own)
+        completed = client.complete_chat_prefix(prompt, closed)
+    row = {"name": decision.name, "question": decision.question, "label": chosen, "value": value,
+           "probabilities": probabilities, "thinking": None,
+           "turn": completed[len(base):] if completed.startswith(base) else None}
+    return row, completed
+
+
+def _is_number(value: Any) -> bool:
+    return type(value) is int or (type(value) is float and math.isfinite(value))
+
+
 def _execute_dependency_decisions(
     client, context, decisions, mode, temperature, rng, numeric_max_digits,
-    image_count=0, prefix_cached=False,
+    image_count=0, prefix_cached=False, given=None, skip=frozenset(), turns=None,
 ):
     rows_by_name = {}
     prompts_by_name = {}
     ancestors = {}
     hidden = {d.name for d in decisions if d.effort_for is not None}
     by_name = {d.name: d for d in decisions}
+    given = given or {}
+    # A given or skipped field asks no effort question.
+    skip = set(skip) | {d.name for d in decisions if d.effort_for in given or d.effort_for in skip}
 
     def confidence(name: str) -> float | None:
         """A dependency's confidence, for a "when" that tests it; None without probabilities."""
@@ -1077,16 +1296,19 @@ def _execute_dependency_decisions(
             # is skipped only when all of its properties are.
             groups = (decision.dependency_groups if decision.dependency_groups is not None
                       else tuple((name,) for name in decision.depends_on or ()))
-            if any(all(rows_by_name[name] is None for name in group) for group in groups) or (
+            # A given answer stands whatever its dependencies and its "when" say.
+            unmet = decision.name not in given and (
+                any(all(rows_by_name[name] is None for name in group) for group in groups) or (
                     decision.when is not None and not condition_met(
                         decision, {name: rows_by_name[name]["value"] for name, _ in decision.when},
                         {name: confidence(name) for name, tests in decision.when
-                         if any(operator == "confidence" for operator, _ in tests)})):
+                         if any(operator == "confidence" for operator, _ in tests)})))
+            if decision.name in skip or unmet:
                 rows_by_name[decision.name] = prompts_by_name[decision.name] = None
                 continue
             visible = set(decision.depends_on or ())
             for name in decision.depends_on or ():
-                visible.update(ancestors[name])
+                visible.update(ancestors.get(name, ()))  # a skipped dependency has none
             ancestors[decision.name] = visible
             # An effort question is invisible to the field it serves: the field's
             # prompt is the one it would have without thinking: "auto".
@@ -1105,6 +1327,11 @@ def _execute_dependency_decisions(
                 if d.name in visible and rows_by_name[d.name] is not None:
                     _put(values, _path(d), rows_by_name[d.name]["value"])
             dependency_values[decision.name] = values
+            if decision.name in given:
+                rows_by_name[decision.name], prompts_by_name[decision.name] = _given_row(
+                    client, context, decision, given[decision.name], parent_prefixes.get(decision.name),
+                    values, image_count, (turns or {}).get(decision.name))
+                continue
             if isinstance(decision, ArrayChoice):
                 arrays.append(decision)
                 continue
@@ -1361,15 +1588,14 @@ def _execute_batch_decisions(
 ) -> tuple[list[dict], list[str]]:
     """prefix_cached: the context's prompt was just sent, so SGLang has it cached and it needs no warm-up."""
     def question_content(decision):
-        content = decision.opening_text()
-        values = (dependency_values or {}).get(decision.name, {})
-        if values:
-            content = "Dependency results (JSON):\n" + json.dumps(values, ensure_ascii=False) + "\n\n" + content
-        return content
+        return _question_content(decision, (dependency_values or {}).get(decision.name, {}))
 
     incremental = parent_prefixes is not None
 
-    def complete(prompt, messages, answer):
+    answered = {}  # index -> (the prompt answered, the answer), for each field's turn
+
+    def complete(index, prompt, messages, answer):
+        answered[index] = (prompt, answer)
         if incremental:
             return client.complete_chat_prefix(prompt, answer)
         return client.render_chat(
@@ -1545,9 +1771,10 @@ def _execute_batch_decisions(
         for (index, decision, messages, prompt), (value, _completed, generated_text) in zip(
                 numeric_pending, _parse_numbers(number_items, raw_numbers)):
             open_results[index] = (open_row(decision, value),
-                                   complete(prompt, messages, _closed_answer(decision, generated_text)))
+                                   complete(index, prompt, messages, _closed_answer(decision, generated_text)))
         for (index, decision, messages, prompt), value in zip(text_pending, values):
-            completed = complete(prompt, messages, _closed_answer(decision, json.dumps(value, ensure_ascii=False)))
+            completed = complete(index, prompt, messages,
+                                 _closed_answer(decision, json.dumps(value, ensure_ascii=False)))
             open_results[index] = (open_row(decision, value), completed)
 
     grouped_scores = []
@@ -1608,6 +1835,7 @@ def _execute_batch_decisions(
         semantic_value = decision.choices[selected]
         completed_prompts.append(
             complete(
+                index,
                 prompts[finite_index],
                 shared_messages + [{"role": "user", "content": question_content(decision)}],
                 _closed_value(decision, semantic_value) if decision.by_value
@@ -1657,6 +1885,18 @@ def _execute_batch_decisions(
     for index, row in enumerate(results):
         slot = decision_slots[index]
         row["thinking"] = read(raw_prompts[slot], ready[slot]) if callable(read) and defer else None
+    # Each field's turn: what its prompt adds to the one it continues, the question, any reasoning
+    # and the answer, verbatim. Given back, it rebuilds the prompt exactly, reasoning included.
+    # A template that cannot continue a prompt leaves no turns: given answers are then rebuilt.
+    parts = getattr(client, "_continuation_parts", None)
+    try:
+        closing = parts()[0] if callable(parts) else None
+    except SGLangError:
+        closing = None
+    for index, row in enumerate(results):
+        base = (parent_prefixes or {}).get(decisions[index].name, shared_prefix)
+        full = answered[index][0] + answered[index][1] + closing if closing is not None else ""
+        row["turn"] = full[len(base):] if full.startswith(base) else None
     return results, completed_prompts
 
 
