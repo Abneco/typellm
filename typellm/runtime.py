@@ -43,8 +43,32 @@ DEFAULT_SOCKET_TIMEOUT = 120.0
 
 
 def _closed_answer(decision: "Choice", value_json: str) -> str:
-    """The full answer an open field leaves in history, e.g. {"total": 174600}."""
+    """The full answer an open field leaves in history, e.g. {"total": 174600}; a box's, its
+    coordinates as the model writes them: {"bbox_2d": [199, 166, 400, 500]}."""
+    if decision.box:
+        return decision.answer_prefill + value_json + "]}"
     return decision.answer_prefill + " " + value_json + "}" if decision.answer_prefill else value_json
+
+
+# A box is asked as the model grounds things itself: [x1, y1, x2, y2], each from 0 to 1000 across
+# the image, x from its left edge and y from its top. The answer is decoded to that grammar.
+BOX_COORDINATE = r"(?:1000|[1-9][0-9]{0,2}|0)"
+BOX_PATTERN = ", ".join([BOX_COORDINATE] * 4) + r"\]\}?"
+# Tokens for the four coordinates and their separators, one digit a token at worst.
+BOX_MAX_TOKENS = 32
+
+
+def _box_value(text: str) -> tuple[dict[str, float], str]:
+    """A decoded box as its value, {"top", "bottom", "left", "right"} from 0 to 1, and its
+    coordinates as history keeps them. Edges given the wrong way round are put in order."""
+    numbers = [int(part) for part in text.strip().rstrip("}").rstrip().rstrip("]").split(",")]
+    if len(numbers) != 4 or any(not 0 <= n <= 1000 for n in numbers):
+        raise ValueError(f"Generated an invalid box: {text!r}")
+    x1, y1, x2, y2 = numbers
+    left, right = sorted((x1, x2))
+    top, bottom = sorted((y1, y2))
+    value = {"top": top / 1000, "bottom": bottom / 1000, "left": left / 1000, "right": right / 1000}
+    return value, f"{left}, {top}, {right}, {bottom}"
 
 
 def _closed_label(decision: "Choice", label: str) -> str:
@@ -103,9 +127,11 @@ class Choice:
     # More choices than labels: the prompt lists values, the answer writes one, and the client's
     # choice scorer gives each its probability. choices is keyed "0", "1", ... in enum order.
     by_value: bool = False
+    # A box: where something is in the image (see BOX_PATTERN).
+    box: bool = False
 
     def __post_init__(self) -> None:
-        if not self.choices and self.numeric_type is None and not self.text_type:
+        if not self.choices and self.numeric_type is None and not self.text_type and not self.box:
             raise ValueError("Choice.choices must not be empty")
         if self.text_type and (self.choices or self.numeric_type is not None):
             raise ValueError("Text choices cannot have enum values or a numeric type")
@@ -136,6 +162,10 @@ class Choice:
         Chat models tend to answer {"name": value}, so the value is decoded right
         where they would write it.
         """
+        if self.box:
+            # The key the model grounds with, whatever the field's name: a box's own name can
+            # pull the model to answer the thing itself, such as the total, not where it is.
+            return '{"bbox_2d": ['
         if self.field_name is None or not (self.text_type or self.numeric_type is not None):
             return ""
         # No trailing space: in {"name": 12} the space belongs to the value's first token.
@@ -160,6 +190,12 @@ class Choice:
         # A nullable field says "or null" in both its type and its answer: a bare
         # <number> reads as "a number is required" and pulls absent values to 0.
         or_null = " or null" if self.nullable else ""
+        if self.box:
+            lines.append("Type: bounding box")
+            lines.append(f"Instructions: {self.question}")
+            lines.append('Answer with its bounding box in the image as {"bbox_2d": [x1, y1, x2, y2]}, each '
+                         "from 0 to 1000: x from the left edge, y from the top.")
+            return "\n".join(lines)
         if self.text_type:
             kind = f"string{or_null}"
         elif self.numeric_type is not None:
@@ -475,9 +511,12 @@ class TypeLLMClient:
                     dependency_groups=item.dependency_groups,
                     descriptions=item.descriptions,
                     levels=item.levels,
+                    box=item.box,
                 )
 
             def bind_array(array):
+                if any(item.box for item in array.items):
+                    raise SchemaError(f"{array.name!r}: a box is not supported inside an array's items")
                 return ArrayChoice(
                     name=array.name,
                     question=array.question,
@@ -653,6 +692,9 @@ class TypeLLMClient:
         with call_scope(timeout, cancel) as scope:
             try:
                 decisions = self.compile_schema(schema)
+                boxes = [d.name for d in decisions if getattr(d, "box", False)]
+                if boxes and not encoded_images:
+                    raise SchemaError(f"{boxes!r} are boxes: a box locates something in an image, so the call needs images")
                 given_by_name = _given_by_name(decisions, given or {})
                 skip = _skip_names(decisions, skipped or ())
                 count = getattr(self.sglang, "count_tokens", None)
@@ -1010,6 +1052,10 @@ def _parse_numbers(
     """Read the grammar-generated numbers: (value, closed prompt, value text)."""
     outputs = []
     for (prompt, decision), raw in zip(items, texts):
+        if decision.box:
+            value, coordinates = _box_value(raw)
+            outputs.append((value, prompt + coordinates + "]}", coordinates))
+            continue
         text = raw.strip()
         if text.endswith("}"):
             text = text[:-1].rstrip()
@@ -1217,6 +1263,12 @@ def _given_row(client, context: str, decision: Any, given: Any, parent: str | No
     chosen = None
     if value is None and decision.nullable and (decision.text_type or decision.numeric_type is not None):
         closed = _closed_answer(decision, "null")
+    elif decision.box:
+        edges = ("top", "bottom", "left", "right")
+        if (not isinstance(value, Mapping) or set(value) != set(edges)
+                or not all(_is_number(value[edge]) and 0 <= value[edge] <= 1 for edge in edges)):
+            raise SchemaError(f"given {label} must be a box: top, bottom, left and right from 0 to 1")
+        closed = _closed_answer(decision, ", ".join(str(round(value[edge] * 1000)) for edge in ("left", "top", "right", "bottom")))
     elif decision.text_type:
         if not isinstance(value, str):
             raise SchemaError(f"given {label} must be a string")
@@ -1670,7 +1722,8 @@ def _execute_batch_decisions(
         if decision.text_type:
             text_pending.append((index, decision, messages))
             continue
-        if decision.numeric_type is not None:
+        # A box decodes beside the numbers, to its own grammar.
+        if decision.numeric_type is not None or decision.box:
             numeric_pending.append((index, decision, messages))
             continue
         if decision.by_value:
@@ -1735,7 +1788,7 @@ def _execute_batch_decisions(
 
     open_pending = [(index, decision, messages, ready[decision_slots[index]])
                     for index, decision, messages in numeric_pending + text_pending]
-    numeric_pending = [item for item in open_pending if item[1].numeric_type is not None]
+    numeric_pending = [item for item in open_pending if item[1].numeric_type is not None or item[1].box]
     text_pending = [item for item in open_pending if item[1].text_type]
 
     # A layer's numbers and strings decode side by side in one request, and its choices are
@@ -1749,9 +1802,11 @@ def _execute_batch_decisions(
         text_seed = rng.randrange(2**31) if text_pending else 0
         fields = (
             [prompt for prompt, _ in number_items],
-            [numeric_pattern(d.numeric_type or "", numeric_max_digits, d.nullable) for _, d in number_items],
-            # Digits, sign, point and the closing brace; tokens hold one or more characters.
-            numeric_max_digits + 4,
+            [BOX_PATTERN if d.box else numeric_pattern(d.numeric_type or "", numeric_max_digits, d.nullable)
+             for _, d in number_items],
+            # Digits, sign, point and the closing brace; tokens hold one or more characters. A box
+            # needs its four coordinates.
+            max(numeric_max_digits + 4, BOX_MAX_TOKENS if any(d.box for _, d in number_items) else 0),
             # From {"name": the model writes the string's first token, quote included.
             [prompt + decision.answer_prefill for _, decision, _, prompt in text_pending],
         )

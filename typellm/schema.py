@@ -59,6 +59,8 @@ class Decision:
     # A score's ordered levels, lowest first: its choices are their labels, and its value is the
     # probability-weighted average of their indices. Empty for every other field.
     levels: tuple[str, ...] = ()
+    # A box: where something is in the image, as {"top", "bottom", "left", "right"} from 0 to 1.
+    box: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,9 @@ EFFORT_QUESTION = (
 def _describe(decision: Decision) -> str:
     """A field's type, instructions and choices, as its own prompt states them."""
     or_null = " or null" if decision.nullable else ""
-    if decision.text_type:
+    if decision.box:
+        kind = "bounding box"
+    elif decision.text_type:
         kind = "string" + or_null
     elif decision.numeric_type is not None:
         kind = decision.numeric_type + or_null
@@ -576,6 +580,8 @@ def _scalar(name: str, label: str, field: Mapping[str, Any], limit: int | None =
         if len(field_type) != 2 or len(kinds) != 1 or not isinstance(kinds[0], str):
             raise SchemaError(f'type for {label!r} must be one type or [type, "null"]')
         field_type, nullable = kinds[0], True
+    if field_type == "box":
+        return _box(name, label, question, field, nullable)
     if "levels" in field:
         return _score(name, label, question, field, field_type, nullable)
     enum = field.get("enum")
@@ -682,6 +688,20 @@ def _scalar(name: str, label: str, field: Mapping[str, Any], limit: int | None =
                     permutations=permutations, nullable=nullable, descriptions=descriptions)
 
 
+def _box(name: str, label: str, question: str, field: Mapping[str, Any], nullable: bool) -> Decision:
+    """A box: where the instructions' target is in the image. There is always one; a boolean field
+    asks whether the target is there."""
+    if nullable:
+        raise SchemaError(f"a box ({label!r}) cannot be null: it always returns a box; "
+                          "ask a boolean field whether the target is there")
+    for keyword in ("enum", "choices", "levels", "return_probabilities", "permutations"):
+        if keyword in field:
+            raise SchemaError(f"{keyword} is not supported on a box ({label!r})")
+    if "instructions" not in field and "description" not in field:
+        question = f'Locate "{label}" in the image.'
+    return Decision(name, question, (), "Box", box=True)
+
+
 def _score(name: str, label: str, question: str, field: Mapping[str, Any], field_type: Any,
            nullable: bool) -> Decision:
     """A score: a number from ordered "levels", [{"label": ..., "description": ...}, ...], lowest first.
@@ -786,6 +806,9 @@ def _condition(name: str, field: Mapping[str, Any], by_name: Mapping[str, Decisi
         if parent not in by_name:
             raise SchemaError(f"when for {name!r} names {parent!r}, which is not a field")
         source = by_name[parent]
+        if source.box:
+            raise SchemaError(f"when for {name!r} names {parent!r}, a box; a condition can test a box's presence "
+                              "with a boolean field instead")
         if not isinstance(test, Mapping):
             test = {"in": test if isinstance(test, list) else [test]}
         if not test:
