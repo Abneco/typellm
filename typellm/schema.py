@@ -61,6 +61,12 @@ class Decision:
     levels: tuple[str, ...] = ()
     # A box: where something is in the image, as {"top", "bottom", "left", "right"} from 0 to 1.
     box: bool = False
+    # An array of boxes: every match in the image, listed in one answer; (minItems, maxItems).
+    box_list: tuple[int, int] | None = None
+    # An array of boxes that may be empty asks first whether there is any match: presence_from on
+    # the list names that hidden question, presence_for on it names the list.
+    presence_from: str | None = None
+    presence_for: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,9 @@ MAX_ARRAY_ITEMS = 50
 # context and arrays the model produces alike: "would another item improve the array" stopped empty
 # arrays early, and "does the context mention another" stopped produced ones.
 CONTINUE_QUESTION = "Should a new item be appended to the current array?"
+# Asked before an array of boxes that may be empty: a model listing boxes lists some whether or
+# not the image has the target, and answers this yes or no reliably.
+PRESENCE_QUESTION = "Is there at least one match for the question below in the image?\n\nThe question:\n{question}"
 # The name the question is asked under, so its answer starts as a field's does.
 CONTINUE_FIELD = "append_item"
 # What opens the prompt of an item, or of each property of an object item.
@@ -128,7 +137,9 @@ EFFORT_QUESTION = (
 def _describe(decision: Decision) -> str:
     """A field's type, instructions and choices, as its own prompt states them."""
     or_null = " or null" if decision.nullable else ""
-    if decision.box:
+    if decision.box_list:
+        kind = "list of bounding boxes"
+    elif decision.box:
         kind = "bounding box"
     elif decision.text_type:
         kind = "string" + or_null
@@ -200,6 +211,11 @@ def _compile(schema: Mapping[str, Any]) -> list[Decision | ArrayField]:
             members = _object_entries((name,), field, name, inside_array=False, around=scope)
             entries.extend(members)
             scope[name] = ("object", tuple(entry.decision.name for entry in members))
+            order.append(name)
+        elif kind == "array" and _boxes(field):
+            # Every box is found in one answer, as the model lists them: one field, not an array's turns.
+            entries.append(_Entry(_box_list(name, field), field, None))
+            scope[name] = ("scalar", name)
             order.append(name)
         elif kind == "array":
             scope[name] = ("array", name)
@@ -353,14 +369,8 @@ def _object_entries(path: tuple[str, ...], field: Mapping[str, Any], label: str,
     return entries
 
 
-def _array(name: str, field: Mapping[str, Any]) -> ArrayField:
-    """An array field, its items compiled and linked; its own depends_on and when come later."""
-    question = _question(name, field, f'All the items of "{name}".')
-    if "items" not in field:
-        raise SchemaError(f"array {name!r} needs items")
-    items = field["items"]
-    if not isinstance(items, Mapping):
-        raise SchemaError(f"items for {name!r} must be a schema object")
+def _item_bounds(name: str, field: Mapping[str, Any]) -> tuple[int, int | None]:
+    """An array's minItems and maxItems, checked."""
     min_items = field.get("minItems", 0)
     if type(min_items) is not int or min_items < 0:
         raise SchemaError(f"minItems for {name!r} must be a non-negative integer")
@@ -371,6 +381,37 @@ def _array(name: str, field: Mapping[str, Any]) -> ArrayField:
         raise SchemaError(f"minItems for {name!r} is more than its maxItems")
     if min_items > MAX_ARRAY_ITEMS or (max_items or 0) > MAX_ARRAY_ITEMS:
         raise SchemaError(f"an array holds at most {MAX_ARRAY_ITEMS} items (on {name!r})")
+    return min_items, max_items
+
+
+def _boxes(field: Mapping[str, Any]) -> bool:
+    """Whether an array's items are boxes."""
+    items = field.get("items")
+    return isinstance(items, Mapping) and items.get("type") == "box"
+
+
+def _box_list(name: str, field: Mapping[str, Any]) -> Decision:
+    """An array of boxes: every match for the instructions in the image, from none to maxItems."""
+    if set(field["items"]) != {"type"}:
+        raise SchemaError(f"the items of {name!r} take only their type, box: "
+                          "say what to find in the array's instructions")
+    if "continue_from" in field:
+        raise SchemaError(f"continue_from is not supported on an array of boxes ({name!r})")
+    min_items, max_items = _item_bounds(name, field)
+    question = _question(name, field, f'Every "{name}" in the image.')
+    return Decision(name, question, (), "Box", box=True,
+                    box_list=(min_items, MAX_ARRAY_ITEMS if max_items is None else max_items))
+
+
+def _array(name: str, field: Mapping[str, Any]) -> ArrayField:
+    """An array field, its items compiled and linked; its own depends_on and when come later."""
+    question = _question(name, field, f'All the items of "{name}".')
+    if "items" not in field:
+        raise SchemaError(f"array {name!r} needs items")
+    items = field["items"]
+    if not isinstance(items, Mapping):
+        raise SchemaError(f"items for {name!r} must be a schema object")
+    min_items, max_items = _item_bounds(name, field)
     label = f"{name}.items"
     kind = _kind(label, items)
     if kind == "array":
@@ -553,6 +594,16 @@ def _link(entries: Sequence[_Entry]) -> list[Decision]:
                                      path=(decision.path or (decision.name,)) + ("thinking_effort",)))
             compiled.append(replace(decision, depends_on=(dependencies or ()) + (effort,), effort_from=effort,
                                     when=when, dependency_groups=(groups_t or ()) + ((effort,),)))
+            continue
+        if decision.box_list and decision.box_list[0] == 0:
+            present = f"{decision.name}.present"
+            # Asked with the list's own dependencies and condition, one layer before it; no: the list is empty.
+            compiled.append(Decision(present, PRESENCE_QUESTION.format(question=_describe(decision)),
+                                     (True, False), "Bool", depends_on=dependencies, thinking=False,
+                                     presence_for=decision.name, when=when, dependency_groups=groups_t,
+                                     path=(decision.name, "present")))
+            compiled.append(replace(decision, depends_on=(dependencies or ()) + (present,), presence_from=present,
+                                    when=when, dependency_groups=(groups_t or ()) + ((present,),)))
             continue
         compiled.append(replace(decision, depends_on=dependencies, thinking=thinking, thinking_budget=budget,
                                 when=when, dependency_groups=groups_t))

@@ -45,6 +45,8 @@ DEFAULT_SOCKET_TIMEOUT = 120.0
 def _closed_answer(decision: "Choice", value_json: str) -> str:
     """The full answer an open field leaves in history, e.g. {"total": 174600}; a box's, its
     coordinates as the model writes them: {"bbox_2d": [199, 166, 400, 500]}."""
+    if decision.box_list:
+        return decision.answer_prefill + value_json  # the list after its "[", closing bracket included
     if decision.box:
         return decision.answer_prefill + value_json + "]}"
     return decision.answer_prefill + " " + value_json + "}" if decision.answer_prefill else value_json
@@ -56,6 +58,31 @@ BOX_COORDINATE = r"(?:1000|[1-9][0-9]{0,2}|0)"
 BOX_PATTERN = ", ".join([BOX_COORDINATE] * 4) + r"\]\}?"
 # Tokens for the four coordinates and their separators, one digit a token at worst.
 BOX_MAX_TOKENS = 32
+# An array of boxes is the list the model writes when it grounds several things, after its "[":
+# [{"bbox_2d": [x1, y1, x2, y2]}, ...], each box its own coordinates.
+_BOX_ITEM = r'\{"bbox_2d": \[' + ", ".join([BOX_COORDINATE] * 4) + r"\]\}"
+# Tokens for one box in the list: its key, coordinates and separators.
+BOX_ITEM_TOKENS = 28
+
+
+def box_list_pattern(min_items: int, max_items: int) -> str:
+    """The grammar of a list of boxes after its "[": from min_items to max_items boxes, then "]"."""
+    more = _BOX_ITEM + ("(?:, " + _BOX_ITEM + "){" + f"{max(min_items - 1, 0)},{max_items - 1}" + "}")
+    return (more if min_items else "(?:" + more + ")?") + r"\]"
+
+
+def _box_list_value(text: str) -> tuple[list[dict[str, float]], str]:
+    """A decoded list of boxes as its value, each as _box_value gives it, and as history keeps it,
+    after the "[". A box the list already holds is not added again."""
+    boxes = json.loads("[" + text)
+    values: list[dict[str, float]] = []
+    written: list[str] = []
+    for box in boxes:
+        value, coordinates = _box_value(", ".join(str(n) for n in box["bbox_2d"]))
+        if value not in values:
+            values.append(value)
+            written.append('{"bbox_2d": [' + coordinates + "]}")
+    return values, ", ".join(written) + "]"
 
 
 def _box_value(text: str) -> tuple[dict[str, float], str]:
@@ -129,6 +156,14 @@ class Choice:
     by_value: bool = False
     # A box: where something is in the image (see BOX_PATTERN).
     box: bool = False
+    box_list: tuple[int, int] | None = None
+    presence_from: str | None = None
+    presence_for: str | None = None
+
+    @property
+    def hidden(self) -> bool:
+        """A question the call asks for a field's sake, never in the result: an effort, a presence."""
+        return self.effort_for is not None or self.presence_for is not None
 
     def __post_init__(self) -> None:
         if not self.choices and self.numeric_type is None and not self.text_type and not self.box:
@@ -162,6 +197,8 @@ class Choice:
         Chat models tend to answer {"name": value}, so the value is decoded right
         where they would write it.
         """
+        if self.box_list:
+            return "["
         if self.box:
             # The key the model grounds with, whatever the field's name: a box's own name can
             # pull the model to answer the thing itself, such as the total, not where it is.
@@ -190,6 +227,13 @@ class Choice:
         # A nullable field says "or null" in both its type and its answer: a bare
         # <number> reads as "a number is required" and pulls absent values to 0.
         or_null = " or null" if self.nullable else ""
+        if self.box_list:
+            lines.append("Type: list of bounding boxes")
+            lines.append(f"Instructions: {self.question}")
+            lines.append('Answer with a JSON list of every match, each as {"bbox_2d": [x1, y1, x2, y2]} with '
+                         "coordinates from 0 to 1000: x from the left edge, y from the top. "
+                         "Answer [] if there is none.")
+            return "\n".join(lines)
         if self.box:
             lines.append("Type: bounding box")
             lines.append(f"Instructions: {self.question}")
@@ -257,6 +301,9 @@ class ArrayChoice:
     dependency_groups: tuple[tuple[str, ...], ...] | None = None
     effort_for: None = None
     effort_from: None = None
+    presence_for: None = None
+    presence_from: None = None
+    hidden: bool = False
     return_probabilities: bool = False
     # Items the caller already has: the array starts from them (schema's continue_from).
     continue_from: tuple[Any, ...] = ()
@@ -512,6 +559,9 @@ class TypeLLMClient:
                     descriptions=item.descriptions,
                     levels=item.levels,
                     box=item.box,
+                    box_list=item.box_list,
+                    presence_from=item.presence_from,
+                    presence_for=item.presence_for,
                 )
 
             def bind_array(array):
@@ -921,7 +971,7 @@ def _assemble(decisions: Sequence[Any], rows: Sequence[dict | None], prefix: str
 
     output: dict[str, Any] = {}
     for decision, row in zip(decisions, rows):
-        if decision.effort_for is None and row is not None:  # not a hidden effort question, not skipped
+        if not decision.hidden and row is not None:  # not a hidden question, not skipped
             _put(output, _path(decision), row["value"] if isinstance(decision, ArrayChoice)
                  else _answer(decision, row))
     thinking: dict[str, str] = {}
@@ -929,6 +979,8 @@ def _assemble(decisions: Sequence[Any], rows: Sequence[dict | None], prefix: str
     skipped: list[str] = []
     for decision, row in zip(decisions, rows):
         path = _path(decision)
+        if decision.presence_for is not None:
+            continue
         if decision.effort_for is not None:
             if row is not None:
                 effort[label(path[:-1])] = row["value"]
@@ -1052,6 +1104,10 @@ def _parse_numbers(
     """Read the grammar-generated numbers: (value, closed prompt, value text)."""
     outputs = []
     for (prompt, decision), raw in zip(items, texts):
+        if decision.box_list:
+            value, written = _box_list_value(raw)
+            outputs.append((value, prompt + written, written))
+            continue
         if decision.box:
             value, coordinates = _box_value(raw)
             outputs.append((value, prompt + coordinates + "]}", coordinates))
@@ -1193,10 +1249,10 @@ def _given_value(given: Mapping[str, Any], path: Sequence[str]) -> Any:
 def _skip_names(decisions: Sequence[Any], skipped: Sequence[str]) -> set[str]:
     """The decisions skipped names, as Generation.skipped names them: a field, an object or a property."""
     paths = [tuple(name.split(".")) for name in skipped]
-    names = {d.name for d in decisions if d.effort_for is None and any(
+    names = {d.name for d in decisions if not d.hidden and any(
         _path(d)[:len(path)] == path for path in paths)}
     unknown = [name for name, path in zip(skipped, paths)
-               if not any(_path(d)[:len(path)] == path for d in decisions if d.effort_for is None)]
+               if not any(_path(d)[:len(path)] == path for d in decisions if not d.hidden)]
     if unknown:
         raise SchemaError(f"skipped names fields the schema does not have: {unknown!r}")
     return names
@@ -1206,12 +1262,12 @@ def _given_by_name(decisions: Sequence[Any], given: Mapping[str, Any]) -> dict[s
     """Each given decision's value, by decision name; a value is checked when its row is made."""
     by_name = {}
     for decision in decisions:
-        if decision.effort_for is not None:
+        if decision.hidden:
             continue
         value = _given_value(given, _path(decision))
         if value is not _MISSING:
             by_name[decision.name] = value
-    tops = {_path(d)[0] for d in decisions if d.effort_for is None}
+    tops = {_path(d)[0] for d in decisions if not d.hidden}
     unknown = [name for name in given if name not in tops]
     if unknown:
         raise SchemaError(f"given names fields the schema does not have: {unknown!r}")
@@ -1263,6 +1319,18 @@ def _given_row(client, context: str, decision: Any, given: Any, parent: str | No
     chosen = None
     if value is None and decision.nullable and (decision.text_type or decision.numeric_type is not None):
         closed = _closed_answer(decision, "null")
+    elif decision.box_list:
+        low, high = decision.box_list
+        edges = ("top", "bottom", "left", "right")
+        if (not isinstance(value, list) or not low <= len(value) <= high
+                or not all(isinstance(box, Mapping) and set(box) == set(edges)
+                           and all(_is_number(box[edge]) and 0 <= box[edge] <= 1 for edge in edges)
+                           for box in value)):
+            raise SchemaError(f"given {label} must be a list of {low} to {high} boxes: "
+                              "top, bottom, left and right from 0 to 1")
+        closed = _closed_answer(decision, ", ".join(
+            '{"bbox_2d": [' + ", ".join(str(round(box[edge] * 1000)) for edge in ("left", "top", "right", "bottom"))
+            + "]}" for box in value) + "]")
     elif decision.box:
         edges = ("top", "bottom", "left", "right")
         if (not isinstance(value, Mapping) or set(value) != set(edges)
@@ -1326,11 +1394,12 @@ def _execute_dependency_decisions(
     rows_by_name = {}
     prompts_by_name = {}
     ancestors = {}
-    hidden = {d.name for d in decisions if d.effort_for is not None}
+    hidden = {d.name for d in decisions if d.hidden}
     by_name = {d.name: d for d in decisions}
     given = given or {}
-    # A given or skipped field asks no effort question.
-    skip = set(skip) | {d.name for d in decisions if d.effort_for in given or d.effort_for in skip}
+    # A given or skipped field asks no effort or presence question.
+    skip = set(skip) | {d.name for d in decisions
+                        if d.hidden and (d.effort_for or d.presence_for) in set(given) | set(skip)}
 
     def confidence(name: str) -> float | None:
         """A dependency's confidence, for a "when" that tests it; None without probabilities."""
@@ -1387,6 +1456,13 @@ def _execute_dependency_decisions(
             if isinstance(decision, ArrayChoice):
                 arrays.append(decision)
                 continue
+            if decision.presence_from is not None:
+                if not rows_by_name[decision.presence_from]["value"]:
+                    # No match in the image: the list is empty, and no box is asked for.
+                    rows_by_name[decision.name], prompts_by_name[decision.name] = _given_row(
+                        client, context, decision, [], parent_prefixes.get(decision.name), values, image_count, None)
+                    continue
+                decision = replace(decision, box_list=(1, decision.box_list[1]))
             if decision.effort_from is not None:
                 budget = THINKING_EFFORTS[rows_by_name[decision.effort_from]["value"]]
                 decision = replace(decision, thinking=budget is not None, thinking_budget=budget)
@@ -1802,11 +1878,14 @@ def _execute_batch_decisions(
         text_seed = rng.randrange(2**31) if text_pending else 0
         fields = (
             [prompt for prompt, _ in number_items],
-            [BOX_PATTERN if d.box else numeric_pattern(d.numeric_type or "", numeric_max_digits, d.nullable)
+            [box_list_pattern(*d.box_list) if d.box_list else BOX_PATTERN if d.box
+             else numeric_pattern(d.numeric_type or "", numeric_max_digits, d.nullable)
              for _, d in number_items],
             # Digits, sign, point and the closing brace; tokens hold one or more characters. A box
-            # needs its four coordinates.
-            max(numeric_max_digits + 4, BOX_MAX_TOKENS if any(d.box for _, d in number_items) else 0),
+            # needs its four coordinates, and a list of boxes each of its boxes.
+            max([numeric_max_digits + 4]
+                + [BOX_MAX_TOKENS for _, d in number_items if d.box]
+                + [d.box_list[1] * BOX_ITEM_TOKENS + 4 for _, d in number_items if d.box_list]),
             # From {"name": the model writes the string's first token, quote included.
             [prompt + decision.answer_prefill for _, decision, _, prompt in text_pending],
         )

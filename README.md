@@ -16,6 +16,7 @@
 
 ## Updates
 - 🚀 **[TypeLLM API](https://typellm.ai)** is live: typed outputs without serving a model, $5 free credit. [Try it](https://typellm.ai/dashboard/playground) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
+- **[2026/10/15]** An [array of boxes](#boxes) finds every match in an image: every dog, every line item.
 - **[2026/10/15]** Added [boxes](#boxes): find something in an image, returned as its edges.
 - **[2026/10/14]** Added [tools and human input](#tools-and-human-input): a workflow pauses for answers from your own tools or a person, and resumes with them.
 - **[2026/10/08]** [Conditional fields](#conditional-fields) can test how sure an answer is: `"when": {"category": {"confidence": {"gte": 0.8}}}`.
@@ -441,7 +442,25 @@ response.result  # {"total_line": {"top": 0.652, "bottom": 0.689, "left": 0.287,
 Multiply by the image's width and height for pixels. There is always a box: to
 check that the target is there, ask a boolean field and give the box a `when` on
 it, so the box is asked only when the target is there. A box cannot be null,
-sit inside an array's items, or be tested by a `when`.
+sit inside an object's or an array's items, or be tested by a `when`.
+
+An array of boxes finds every match, from none to `maxItems` (at most 50):
+
+```python
+response = client.generate(
+    context="Read the receipt photo.",
+    images=["receipt.jpg"],
+    questions={"items": {"type": "array", "items": {"type": "box"},
+                         "instructions": "Every line item, each the whole line from its name to its price."}},
+)
+response.result  # {"items": [{"top": 0.421, "bottom": 0.461, "left": 0.12, "right": 0.837},
+                 #            {"top": 0.449, "bottom": 0.493, "left": 0.12, "right": 0.834},
+                 #            {"top": 0.48, "bottom": 0.521, "left": 0.118, "right": 0.829}]}
+```
+
+It returns `[]` when the image has no match. Its `items` take only
+`{"type": "box"}`: say what to find in the array's `instructions`. `minItems`
+and `maxItems` bound it; `continue_from` is not supported.
 
 ## Dependency-aware generation
 
