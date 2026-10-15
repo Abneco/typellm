@@ -16,6 +16,7 @@
 
 ## Updates
 - 🚀 **[TypeLLM API](https://typellm.ai)** is live: typed outputs without serving a model, $5 free credit. [Try it](https://typellm.ai/dashboard/playground) · [Quick start](#typellm-api-cloud) · [Examples](https://typellm.ai/examples).
+- **[2026/10/15]** Added [boxes](#boxes): find something in an image, returned as its edges.
 - **[2026/10/14]** Added [tools and human input](#tools-and-human-input): a workflow pauses for answers from your own tools or a person, and resumes with them.
 - **[2026/10/08]** [Conditional fields](#conditional-fields) can test how sure an answer is: `"when": {"category": {"confidence": {"gte": 0.8}}}`.
 - **[2026/10/05]** Added [objects and arrays](#objects-and-arrays): group typed properties into one value, or return a variable number of typed items.
@@ -421,6 +422,26 @@ response = client.generate(
 Each image can be a local file path, an http(s) URL, a `data:` URI, raw bytes,
 or a PIL image. Local files are read by the client, so the SGLang server does
 not need access to your filesystem.
+
+### Boxes
+
+A `box` field finds something in the image and returns where it is: `top`,
+`bottom`, `left` and `right`, each from 0 to 1 across the image, from its
+top-left corner.
+
+```python
+response = client.generate(
+    context="Read the receipt photo.",
+    images=["receipt.jpg"],
+    questions={"total_line": {"type": "box", "instructions": "The line that shows the total."}},
+)
+response.result  # {"total_line": {"top": 0.652, "bottom": 0.689, "left": 0.287, "right": 0.855}}
+```
+
+Multiply by the image's width and height for pixels. There is always a box: to
+check that the target is there, ask a boolean field and give the box a `when` on
+it, so the box is asked only when the target is there. A box cannot be null,
+sit inside an array's items, or be tested by a `when`.
 
 ## Dependency-aware generation
 
