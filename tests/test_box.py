@@ -1,7 +1,7 @@
 import unittest
 
 from typellm import SchemaError, TypeLLMClient
-from typellm.runtime import BOX_MAX_TOKENS, BOX_PATTERN
+from typellm.runtime import BOX_ITEM_TOKENS, BOX_MAX_TOKENS, BOX_PATTERN, box_list_pattern
 
 from tests.test_batching import FakeServer
 from tests.test_images import PNG
@@ -90,13 +90,127 @@ class BoxTests(unittest.TestCase):
             ({"total": {"type": ["box", "null"]}}, (PNG,), "cannot be null"),
             ({"total": {"type": "box", "enum": [1, 2]}}, (PNG,), "enum is not supported on a box"),
             ({"total": {"type": "box", "return_probabilities": True}}, (PNG,), "return_probabilities is not supported"),
-            ({"rows": {"type": "array", "items": {"type": "box"}}}, (PNG,), "inside an array"),
+            ({"rows": {"type": "array", "items": {"type": "object", "properties": {"at": {"type": "box"}}}}},
+             (PNG,), "inside an array"),
             ({"total": {"type": "box"}, "ok": {"type": "boolean", "when": {"total": None}}}, (PNG,), "a box"),
         ]
         for questions, images, message in cases:
             with self.subTest(message=message):
                 with self.assertRaisesRegex(SchemaError, message):
                     self.run_questions(questions, images=images)
+
+
+
+class ListServer(BoxServer):
+    """A BoxServer that answers a list of boxes' grammar with `listed`, after its "[" as the model writes it,
+    and whether there is any match with `present`."""
+
+    def __init__(self, listed='{"bbox_2d": [100, 200, 300, 400]}, {"bbox_2d": [500, 600, 700, 800]}]', present=True):
+        super().__init__()
+        self.listed = listed
+        self.present = present
+
+    def _request(self, path, payload=None, *, allow_text=False):
+        response = super()._request(path, payload, allow_text=allow_text)
+        if path == "/generate" and "token_ids_logprob" in payload and not self.present:
+            texts = [payload["text"]] if isinstance(payload["text"], str) else payload["text"]
+            for text, item in zip(texts, response if isinstance(response, list) else [response]):
+                if "Is there at least one match" in text[text.rindex("<|im_start|>user"):]:
+                    scores = item["meta_info"]["output_token_ids_logprobs"][0]
+                    # The second label, false, over the first.
+                    scores[0][0], scores[1][0] = -9.0, 0.0
+        if path == "/generate":
+            params = payload["sampling_params"]
+            for one, item in zip(params if isinstance(params, list) else [params],
+                                 response if isinstance(response, list) else [response]):
+                if one.get("regex", "").startswith(("(?:" + r'\{"bbox_2d"', r'\{"bbox_2d"')):
+                    item["text"] = self.listed
+        return response
+
+    def list_requests(self):
+        return [params for payload in self.payloads
+                for params in (payload["sampling_params"] if isinstance(payload["sampling_params"], list)
+                               else [payload["sampling_params"]])
+                if params.get("regex", "").endswith(r"\]") and "bbox_2d" in params.get("regex", "")]
+
+
+class BoxListTests(unittest.TestCase):
+    def run_questions(self, questions, server=None, **options):
+        return BoxTests.run_questions(self, questions, server=server or ListServer(), **options)
+
+    def test_an_array_of_boxes_lists_every_match_in_one_answer(self):
+        questions = {"dogs": {"type": "array", "items": {"type": "box"}, "instructions": "Every dog."}}
+        done, sent, server = self.run_questions(questions)
+        self.assertEqual(done.result["dogs"], [{"top": 0.2, "bottom": 0.4, "left": 0.1, "right": 0.3},
+                                               {"top": 0.6, "bottom": 0.8, "left": 0.5, "right": 0.7}])
+        [prompt] = [t for t in sent if t.endswith("Answer [] if there is none.<|im_end|>\n<|im_start|>assistant\n[")
+                    or t.rstrip().endswith("[") and "list of bounding boxes" in t]
+        self.assertIn("Instructions: Every dog.", prompt)
+        [params] = server.list_requests()
+        # The hidden question said there is a match, so the list holds one at least.
+        self.assertEqual(params["regex"], box_list_pattern(1, 50))
+        self.assertGreaterEqual(params["max_new_tokens"], 50 * BOX_ITEM_TOKENS)
+        self.assertEqual(list(done.result), ["dogs"])  # the presence question is not in the result
+        self.assertEqual(done.skipped, [])
+
+    def test_bounds_shape_the_grammar(self):
+        questions = {"dogs": {"type": "array", "items": {"type": "box"}, "minItems": 1, "maxItems": 3}}
+        _, _, server = self.run_questions(questions)
+        [params] = server.list_requests()
+        self.assertEqual(params["regex"], box_list_pattern(1, 3))
+
+    def test_no_match_is_an_empty_list_and_asks_for_no_boxes(self):
+        questions = {"dogs": {"type": "array", "items": {"type": "box"}},
+                     "count": {"type": "integer", "depends_on": ["dogs"]}}
+        done, sent, server = self.run_questions(questions, server=ListServer(present=False))
+        self.assertEqual(done.result, {"dogs": [], "count": 7})
+        self.assertEqual(server.list_requests(), [])
+        [later] = [t for t in sent if 'Field: "count"' in t[t.rindex("Field:"):]]
+        self.assertIn('assistant\n[]', later)
+
+    def test_a_list_that_must_hold_a_box_asks_no_presence_question(self):
+        questions = {"dogs": {"type": "array", "items": {"type": "box"}, "minItems": 1}}
+        done, sent, _ = self.run_questions(questions, server=ListServer(present=False))
+        self.assertEqual(len(done.result["dogs"]), 2)
+        self.assertFalse(any("Is there at least one match" in t for t in sent))
+
+    def test_a_box_listed_twice_comes_back_once(self):
+        twice = '{"bbox_2d": [100, 200, 300, 400]}, {"bbox_2d": [300, 400, 100, 200]}]'
+        done, _, _ = self.run_questions({"dogs": {"type": "array", "items": {"type": "box"}}}, server=ListServer(twice))
+        self.assertEqual(done.result["dogs"], [{"top": 0.2, "bottom": 0.4, "left": 0.1, "right": 0.3}])
+
+    def test_dependents_see_the_list(self):
+        questions = {"dogs": {"type": "array", "items": {"type": "box"}},
+                     "count": {"type": "integer", "depends_on": ["dogs"]}}
+        done, sent, _ = self.run_questions(questions)
+        [later] = [t for t in sent if 'Field: "count"' in t[t.rindex("Field:"):]]
+        self.assertIn('[{"bbox_2d": [100, 200, 300, 400]}, {"bbox_2d": [500, 600, 700, 800]}]', later)
+
+    def test_a_list_can_be_given(self):
+        boxes = [{"top": 0.2, "bottom": 0.4, "left": 0.1, "right": 0.3}]
+        questions = {"dogs": {"type": "array", "items": {"type": "box"}},
+                     "count": {"type": "integer", "depends_on": ["dogs"]}}
+        done, sent, server = self.run_questions(questions, given={"dogs": boxes})
+        self.assertEqual(done.result["dogs"], boxes)
+        self.assertEqual(server.list_requests(), [])
+        self.assertFalse(any("Is there at least one match" in t for t in sent))
+        [later] = [t for t in sent if 'Field: "count"' in t[t.rindex("Field:"):]]
+        self.assertIn('[{"bbox_2d": [100, 200, 300, 400]}]', later)
+        with self.assertRaisesRegex(SchemaError, "list of 0 to 50 boxes"):
+            self.run_questions(questions, given={"dogs": [{"top": 2}]})
+
+    def test_what_an_array_of_boxes_cannot_be(self):
+        cases = [
+            ({"dogs": {"type": "array", "items": {"type": "box", "instructions": "A dog."}}}, "take only their type"),
+            ({"dogs": {"type": "array", "items": {"type": "box"}, "continue_from": []}}, "continue_from"),
+            ({"dogs": {"type": "array", "items": {"type": "box"}, "maxItems": 60}}, "at most 50"),
+            ({"dogs": {"type": "array", "items": {"type": "box"}},
+              "ok": {"type": "boolean", "when": {"dogs": None}}}, "a box"),
+        ]
+        for questions, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(SchemaError, message):
+                    self.run_questions(questions)
 
 
 if __name__ == "__main__":
