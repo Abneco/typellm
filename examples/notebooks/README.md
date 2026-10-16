@@ -1,6 +1,6 @@
 # Notebooks
 
-Paste your API keys in the cell near the top and run all cells: each notebook calls the APIs itself. card_suit_bets.ipynb, discover_invoice_categories.ipynb, hierarchical_classification.ipynb, time_zones.ipynb, dense_pages.ipynb, discover_schema.ipynb, tools_and_human_input.ipynb, moderation_review.ipynb and confidence_4_or_9.ipynb keep the outputs of one run, so you can read them before running them.
+Paste your API keys in the cell near the top and run all cells: each notebook calls the APIs itself. card_suit_bets.ipynb, discover_invoice_categories.ipynb, hierarchical_classification.ipynb, time_zones.ipynb, dense_pages.ipynb, discover_schema.ipynb, tools_and_human_input.ipynb, moderation_review.ipynb, confidence_4_or_9.ipynb and locate_vehicles_in_a_video.ipynb keep the outputs of one run, so you can read them before running them.
 
 | Notebook | What it shows | Keys to paste |
 | --- | --- | --- |
@@ -13,4 +13,5 @@ Paste your API keys in the cell near the top and run all cells: each notebook ca
 | [discover_schema.ipynb](discover_schema.ipynb) | Discover a schema from three sample rental listings: a meta schema returns typed fields, which become the questions that extract every listing into a table. Keeps the outputs of one run. | `TYPELLM_API_KEY` |
 | [tools_and_human_input.ipynb](tools_and_human_input.ipynb) | Answer support emails in a workflow that stops for what only your side knows: an order's status from your database, and an agent's refund decision. Fields with `"source": "user"` pause the call; `client.resume()` goes on with your answers. Keeps the outputs of one run. | `TYPELLM_API_KEY` |
 | [moderation_review.ipynb](moderation_review.ipynb) | Moderate a batch of comments: the model decides the clear ones, and a call stops for a moderator only when the model's confidence is below 0.8. Keeps the outputs of one run. | `TYPELLM_API_KEY` |
+| [locate_vehicles_in_a_video.ipynb](locate_vehicles_in_a_video.ipynb) | Locate every vehicle in four seconds of a car show: each frame is one call that asks for an array of boxes, drawn back on the frames. Keeps the outputs of one run. | `TYPELLM_API_KEY` |
 | [identical_resumes.ipynb](identical_resumes.ipynb) | Two candidates with the same résumé, asked in both orders: the fair answer is 50/50 whichever is listed first. Compares TypeLLM, Jev and OpenAI's Decisions API. | `TYPELLM_API_KEY`, `TYPESAFE_API_KEY`, `OPENAI_API_KEY` |
