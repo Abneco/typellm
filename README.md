@@ -30,6 +30,19 @@
 - **[2026/09/19]** Added optional [thinking mode](#thinking-mode) with a per-field budget.
 - **[2026/09/18]** Added constrained `integer` and `number` outputs.
 
+## TypeLLM API or self-hosted?
+
+| | TypeLLM API | Self-hosted (this repo + Qwen3.8-27B) |
+|---|---|---|
+| Classes in one choice field | **512** | 26 |
+| Thinking speed | **2.5× faster** | baseline |
+| Arrays of objects | **up to 34% higher recall, 27% faster**; 200 items a call | 50 items a call |
+| Tools and human input in a workflow | **`"source": "user"`**: a call pauses for your tool or a person, then resumes | pass answers yourself in `given` |
+| OpenAI Decisions API and Jev System One | **compatible endpoints** | — |
+| GPU | none: $5 free credit | your own |
+
+Speeds and recall measured by TypeLLM, October 2026.
+
 ## Introduction
 
 TypeLLM brings type-safe generation to existing autoregressive LLMs without changing their architecture or weights. Inspired by [TypeSafe AI's Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), it lets models retain their native thinking and free-form generation while producing schema-guaranteed outputs through JSON Schema. Built on [SGLang](https://github.com/sgl-project/sglang), TypeLLM also supports richer interaction patterns beyond independent typed decisions.
