@@ -6,7 +6,7 @@
 
 <h4 align="center">
   <a href="https://typellm.ai/">Homepage</a>&nbsp; • &nbsp;
-  <a href="https://typellm.ai/blog">Blog</a>&nbsp; • &nbsp;
+  <a href="https://typellm.ai/insights">Insights</a>&nbsp; • &nbsp;
   <a href="https://typellm.ai/docs">Docs</a>&nbsp; • &nbsp;
   <a href="https://typellm.ai/examples">Examples</a>&nbsp; • &nbsp;
   <a href="https://typellm.ai/dashboard">API</a>&nbsp; • &nbsp;
@@ -25,8 +25,8 @@
 - **[2026/10/01]** Added [thinking effort](#thinking-effort): set thinking by level, or let `"thinking": "auto"` choose it on each call.
 - **[2026/09/24]** Added [image input](#image-input) for vision-language models, tested with Qwen3.8-27B.
 - **[2026/09/23]** Added [JevBench results](https://github.com/TypeLLM/TypeLLM/blob/main/evals/jevbench/README.md): TypeLLM scored 195/231 without thinking and 228/231 with thinking.
-- **[2026/09/23]** Added [permutation averaging](#per-question-permutation-averaging) to improve the predictive distribution. See the [blog post](https://typellm.ai/blog/fair-die).
-- **[2026/09/22]** Added `depends_on` dependency graphs with incremental prefix reuse. See the [blog post](https://typellm.ai/blog/type-safe-workflow).
+- **[2026/09/23]** Added [permutation averaging](#per-question-permutation-averaging) to improve the predictive distribution. See the [post](https://typellm.ai/insights/fair-die).
+- **[2026/09/22]** Added `depends_on` dependency graphs with incremental prefix reuse. See the [post](https://typellm.ai/insights/the-workflow-model).
 - **[2026/09/19]** Added optional [thinking mode](#thinking-mode) with a per-field budget.
 - **[2026/09/18]** Added constrained `integer` and `number` outputs.
 
@@ -733,7 +733,7 @@ Use `1` to read the options once, in the order written; that is also how a
 field without `return_probabilities` answers. Enum and boolean fields take this
 option.
 
-[Docs](https://typellm.ai/docs/probabilities#permutation-averaging) · [Read the blog](https://typellm.ai/blog/fair-die)
+[Docs](https://typellm.ai/docs/probabilities#permutation-averaging) · [Read the post](https://typellm.ai/insights/fair-die)
 
 ## Serving
 
